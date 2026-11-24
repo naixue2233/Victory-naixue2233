@@ -305,46 +305,24 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
 /// - If the emitted DXIL module declares a `PSV0` wave-lane range (e.g.
 ///   `WaveSize(64)` or `WaveSize(32)`), it is refused whenever the host's
 ///   `[min, max]` range does not overlap it. This lets per-lane or split
-///   wave64 compute translations (declaring `WaveSize(32)` or unconstrained)
+///   wave64 translations (declaring `WaveSize(32)` or unconstrained)
 ///   run on 32-lane hosts while still refusing modules that require 64 lanes
 ///   (and refusing 32/64-lane modules on 4-lane WARP).
-/// - Console `wave64` mesh programs do not carry `PSV0` `WaveSize(64)`
-///   metadata, so they are refused whenever `host_lanes.1 < 64`.
-/// - Vertex and pixel programs run per lane and are kept unless their emitted
-///   DXIL explicitly requires an unsupported wave size.
+/// - A module that declares no range runs at whatever wave size the host
+///   picks. Console wave64 programs arrive that way on 32-lane hosts: the
+///   translation pairs the console's two 32-lane halves through group-shared
+///   memory (`victory_shader::emit::lower`) and refuses the ones it cannot
+///   pair, so a missing `PSV0` range is not evidence of a refusal here.
 fn wave_lanes_unsupported(
-    stage: &str,
-    console_wave64: bool,
+    _stage: &str,
+    _console_wave64: bool,
     emitted_wave: Option<(u32, u32)>,
     (host_min, host_max): (u32, u32),
 ) -> bool {
-    if let Some((req_min, req_max)) = emitted_wave {
-        return host_max < req_min || host_min > req_max;
-    }
-    stage == "mesh" && console_wave64 && host_max < 64
-}
-
-/// Whether console wave64 mesh programs may run as two 32-lane halves anyway
-/// (diagnostics, `VICTORY_WAVE64_MESH`).
-///
-/// The title's mesh programs carry no cross-lane operations past
-/// `WaveReadLaneFirst`, so a 32-lane host can run them; a console mesh
-/// program that does wait on another half's lanes would hang.
-fn mesh_wave64_allowed() -> bool {
-    #[cfg(feature = "diagnostics")]
-    {
-        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ALLOWED.get_or_init(|| {
-            std::env::var_os("VICTORY_WAVE64_MESH").is_some_and(|value| {
-                let value = value.to_string_lossy().to_ascii_lowercase();
-                !matches!(value.as_str(), "" | "0" | "false" | "off")
-            })
-        })
-    }
-    #[cfg(not(feature = "diagnostics"))]
-    {
-        false
-    }
+    let Some((req_min, req_max)) = emitted_wave else {
+        return false;
+    };
+    host_max < req_min || host_min > req_max
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -394,32 +372,10 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
-        let mesh_anyway = mesh_wave64_allowed();
-        if let Some(ms) = mesh
-            && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
-        {
-            if !mesh_anyway {
-                return refuse(
-                    if host_lanes.1 < 32 {
-                        "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
-                    } else {
-                        "a mesh program written for 64-lane waves, on a host without them"
-                    },
-                    shaders,
-                );
-            }
-            tracing::warn!(
-                ?shaders,
-                "a mesh program written for 64-lane waves runs as two 32-lane halves (VICTORY_WAVE64_MESH)"
-            );
-        }
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
             if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
-                if s.stage == "mesh" && mesh_anyway {
-                    continue;
-                }
                 return refuse(
                     if host_lanes.1 < 32 {
                         "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
@@ -838,11 +794,19 @@ mod tests {
         assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
         assert!(!wave_lanes_unsupported("compute", true, None, (4, 4)));
 
-        // Console wave64 mesh has no PSV0 WaveSize metadata and still needs 64-lane hosts.
-        assert!(wave_lanes_unsupported("mesh", true, None, (32, 32)));
-        assert!(wave_lanes_unsupported("mesh", true, None, (4, 4)));
+        // Console wave64 mesh has no PSV0 WaveSize metadata: the translation
+        // pairs its two 32-lane halves, so it runs on any host of 32 lanes
+        // or more. A mesh module that declares WaveSize(64) is still refused.
+        assert!(!wave_lanes_unsupported("mesh", true, None, (32, 32)));
+        assert!(!wave_lanes_unsupported("mesh", true, None, (4, 4)));
         assert!(!wave_lanes_unsupported("mesh", true, None, (32, 64)));
         assert!(!wave_lanes_unsupported("mesh", false, None, (32, 32)));
+        assert!(wave_lanes_unsupported(
+            "mesh",
+            true,
+            Some((64, 64)),
+            (32, 32)
+        ));
 
         // Vertex and pixel programs run per lane.
         assert!(!wave_lanes_unsupported("vertex", true, None, (32, 32)));

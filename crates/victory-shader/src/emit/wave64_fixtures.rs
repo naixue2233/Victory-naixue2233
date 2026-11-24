@@ -153,9 +153,9 @@ pub(super) fn program(body: &[u32], threads: u32, lds_bytes: u32) -> NativeProgr
 /// Lowers `native` for a host with (or without) 64-lane waves.
 pub(super) fn lower_for(native: &NativeProgram, host_wave64: bool) -> Result<Lowered, ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
-    let io = io::raise(&p, native)?;
     let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, native)?;
     lower(&Parts {
         native,
         p: &p,
@@ -180,20 +180,15 @@ fn one_wave_groups_translate_without_64_lane_waves() {
 }
 
 #[test]
-fn what_cannot_be_emulated_is_refused_with_a_reason() {
-    // Several console waves in one group: their lanes cannot be exchanged
-    // through one group's barriers.
+fn several_waves_and_divergent_steps_translate_without_64_lane_waves() {
+    // Several console waves in one group: each wave pairs through its own
+    // slots, and barriers are only crossed where every thread reaches them.
     let several = program(CROSS_LANE, 128, 512);
     lower_for(&several, true).unwrap();
-    let Err(e) = lower_for(&several, false) else {
-        panic!("translated");
-    };
-    assert!(e.to_string().contains("several 64-lane waves"), "{e}");
-    // A lane read only some lanes reach.
+    lower_for(&several, false).unwrap();
+    // A lane read only some lanes reach fences instead of meeting at a
+    // barrier; the other half's lanes read as 0 there.
     let divergent = program(DIVERGENT_READLANE, 64, 0);
     lower_for(&divergent, true).unwrap();
-    let Err(e) = lower_for(&divergent, false) else {
-        panic!("translated");
-    };
-    assert!(e.to_string().contains("lane-dependent code"), "{e}");
+    lower_for(&divergent, false).unwrap();
 }

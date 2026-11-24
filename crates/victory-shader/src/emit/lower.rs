@@ -230,7 +230,6 @@ struct Lower<'a> {
     emulated: Option<Emulated>,
     /// Compute needing the console's 64-lane waves on a host without them,
     /// in a group of several waves: refused.
-    wave64_refused: bool,
     /// Guarded code being lowered ([`Lower::begin_guarded`] depth).
     guard_depth: u32,
 }
@@ -247,11 +246,15 @@ struct Lower<'a> {
 /// is refused with a reason. Scalar branches stay uniform because every
 /// scalar value made from vector data comes through these same steps.
 struct Emulated {
-    /// Threads in the group (at most 64): the console lanes that exist.
+    /// Console lanes that exist: the wave's (64), or fewer in a compute
+    /// group smaller than one wave.
     lanes: u32,
-    /// Per IR block: every lane that runs the program runs it.
+    /// Per IR block: every thread of the group runs it when any does.
     uniform: Vec<bool>,
-    /// The exchange slots, `[64 x i32]` in group-shared memory.
+    /// The exchange slots, `[64 x i32]` per console wave of the group, in
+    /// group-shared memory. A mesh group of 128 threads holds two console
+    /// waves, and each keeps its own slots ([`Lower::slot`] picks them
+    /// apart), so a wave's halves meet without meeting the other wave's.
     slots: Option<V>,
 }
 
@@ -260,7 +263,7 @@ struct Emulated {
 /// condition reaches it without strictly post-dominating that branch
 /// (lanes reconverge only there), or when it cannot reach the end of the
 /// program (no post-dominance to rely on).
-fn uniform_blocks(st: &Structured) -> Vec<bool> {
+fn uniform_blocks(st: &Structured, whole_group: bool) -> Vec<bool> {
     let n = st.exits.len();
     let words = n.div_ceil(64);
     let succs: Vec<Vec<usize>> = st
@@ -318,6 +321,17 @@ fn uniform_blocks(st: &Structured) -> Vec<bool> {
         if !std::mem::replace(&mut ends[b], true) {
             stack.extend(preds[b].iter().copied());
         }
+    }
+    if whole_group {
+        // A group of several console waves: a step through group-shared
+        // memory waits on a group barrier, which every thread of the group
+        // must reach, so it may only stand where every path from the entry
+        // goes (a barrier some waves reach and others do not never
+        // completes, and the host GPU hangs until the driver resets it).
+        let entry = (0..n).find(|&b| preds[b].is_empty()).unwrap_or(0);
+        return (0..n)
+            .map(|b| ends[b] && pd[entry][b / 64] >> (b % 64) & 1 == 1)
+            .collect();
     }
     let mut uniform = ends;
     for (d, e) in st.exits.iter().enumerate() {
@@ -483,14 +497,12 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        let (mut emulated, mut wave64_refused) = (None, false);
-        if let StageIo::Cs(cs) = x.native.io {
-            s.threads = Some(cs.threads);
-            s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+        let mut emulated = None;
+        // Code reading other lanes needs the console's wave size and lane
+        // order; so do lane masks read as numbers, and LDS shared within one
+        // wave, where the console compiler leaves out barriers.
+        let reads_other_lanes = || {
+            insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -521,21 +533,26 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            };
+            }
+        };
+        if let StageIo::Cs(cs) = x.native.io {
+            s.threads = Some(cs.threads);
+            s.lds_dwords = cs.lds_bytes() / 4;
+            console_lanes = reads_other_lanes();
             let wave = if x.native.wave64 { 64 } else { 32 };
             let lanes = cs.threads.iter().product::<u32>();
             let one_wave = lanes <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 if wave == 64 && !x.host_wave64 {
-                    if one_wave {
-                        emulated = Some(Emulated {
-                            lanes,
-                            uniform: uniform_blocks(x.st),
-                            slots: None,
-                        });
-                    } else {
-                        wave64_refused = true;
-                    }
+                    // A group of several console waves pairs each wave's two
+                    // 32-lane halves through that wave's own slots, as a mesh
+                    // group does; a barrier is only reached by every thread
+                    // where the block post-dominates the entry.
+                    emulated = Some(Emulated {
+                        lanes: wave.min(lanes),
+                        uniform: uniform_blocks(x.st, !one_wave),
+                        slots: None,
+                    });
                 } else {
                     s.wave_size = Some(wave);
                 }
@@ -551,6 +568,17 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // The console's 64-lane waves on a host whose waves are 32: the
+            // group's 128 threads are two console waves, and each wave's two
+            // halves meet through that wave's own group-shared slots.
+            if x.native.wave64 && !x.host_wave64 && (reads_other_lanes() || s.lds_dwords > 0) {
+                console_lanes = true;
+                emulated = Some(Emulated {
+                    lanes: 64,
+                    uniform: uniform_blocks(x.st, ms.threads > 64),
+                    slots: None,
+                });
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -653,7 +681,6 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             emulated,
-            wave64_refused,
             guard_depth: 0,
         }
     }
@@ -975,13 +1002,15 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         use super::wave::Op;
         let c = self.cur;
-        self.emulated_here(self.cur_ir, c)?;
+        let sync = self.emulated_here(self.cur_ir, c);
         if prefix.is_some() && !matches!(op, Op::AddU | Op::AddF) {
             return Err("a wave prefix of an operation other than a sum");
         }
-        let vals = self.gather(c, x);
+        let vals = self.gather(c, x, sync);
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
-        let me = self.mesh_thread();
+        let t = self.mesh_thread();
+        let m = self.s.m.i32(self.wave() - 1);
+        let me = self.s.m.bin(c, Bin::And, t, m);
         let mut acc: Option<V> = None;
         for (n, v) in vals.into_iter().enumerate() {
             let v = if float { self.as_float(v) } else { v };
@@ -1027,13 +1056,6 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
-        if self.wave64_refused {
-            return Err(unsupported(
-                0,
-                "a compute group of several 64-lane waves that reads across lanes \
-                 on a host without 64-lane waves",
-            ));
-        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1420,10 +1442,10 @@ impl<'a> Lower<'a> {
                 let bit = bit?;
                 if self.emulated.is_some() {
                     let ir = self.def_block.get(&lo).copied().unwrap_or(0);
-                    self.emulated_here(ir, at)?;
+                    let sync = self.emulated_here(ir, at);
                     let i32t = self.s.t.i32;
                     let one = self.s.m.cast(at, Cast::ZExt, bit, i32t);
-                    let bits = self.gather(at, one);
+                    let bits = self.gather(at, one, sync);
                     let (mut x, mut y) = (self.s.m.i32(0), self.s.m.i32(0));
                     for (n, b) in bits.into_iter().enumerate() {
                         let sh = self.s.m.i32(n as u32 % 32);
@@ -1957,7 +1979,9 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         let lane = if self.emulated.is_some() {
-            self.mesh_thread()
+            let t = self.mesh_thread();
+            let m = self.s.m.i32(self.wave() - 1);
+            self.s.m.bin(at, Bin::And, t, m)
         } else {
             self.s.op(
                 at,
@@ -2180,9 +2204,14 @@ impl<'a> Lower<'a> {
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
         if self.s.mesh.is_some() {
-            // shortcut: no wave size for mesh shaders in SM 6.6, so host
-            // lanes cannot follow the console's; emulate through group-shared
-            // memory if mesh programs turn out to need these.
+            // shortcut: a mesh shader cannot declare a wave size (SM 6.6),
+            // so host lanes cannot follow the console's. Reading other lanes
+            // goes through group-shared memory instead ([`Emulated`], set up
+            // when the host's waves are 32 lanes); without it the program is
+            // refused.
+            if self.emulated.is_some() {
+                return Ok(());
+            }
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
@@ -2306,8 +2335,11 @@ impl<'a> Lower<'a> {
 
     fn lane_index(&mut self) -> V {
         if self.emulated.is_some() {
-            // Console lane n is the thread with flattened id n.
-            return self.mesh_thread();
+            // Console lane n is the thread with flattened id n, within its
+            // wave: a mesh group of 128 threads holds two console waves.
+            let t = self.mesh_thread();
+            let m = self.s.m.i32(self.wave() - 1);
+            return self.s.m.bin(self.s.entry, Bin::And, t, m);
         }
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -2353,15 +2385,36 @@ impl<'a> Lower<'a> {
     fn read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
         if self.emulated.is_some() {
             let at = self.cur;
-            self.emulated_here(self.cur_ir, at)?;
+            let sync = self.emulated_here(self.cur_ir, at);
             let me = self.mesh_thread();
             let p = self.slot(at, me);
             self.s.m.store(at, p, x);
-            self.group_sync(at);
+            if sync {
+                self.group_sync(at);
+            } else {
+                self.tgsm_fence(at);
+            }
             let q = self.slot(at, lane);
             let r = self.s.m.load(at, q);
-            self.group_sync(at);
-            return Ok(r);
+            if sync {
+                self.group_sync(at);
+                return Ok(r);
+            }
+            // The other half of the console wave runs as another wave here:
+            // its lanes hold nothing this one can read.
+            let half = self.half();
+            let five = self.s.m.i32(5);
+            let theirs = self.s.m.bin(at, Bin::LShr, lane, five);
+            let same = self.s.m.cmp(at, pred::EQ, half, theirs);
+            let same = if self.threads() < 64 {
+                let lim = self.s.m.i32(self.threads());
+                let inside = self.s.m.cmp(at, pred::IULT, lane, lim);
+                self.s.m.bin(at, Bin::And, same, inside)
+            } else {
+                same
+            };
+            let zero = self.s.m.i32(0);
+            return Ok(self.s.m.select(at, same, r, zero));
         }
         Ok(self.s.op(
             self.cur,
@@ -2373,31 +2426,55 @@ impl<'a> Lower<'a> {
         ))
     }
 
-    /// [`Emulated`]: whether a step reading other lanes may run in DXIL
-    /// block `at`, which IR block `ir` lowers to (every lane must get there).
-    fn emulated_here(&self, ir: usize, at: usize) -> Result<(), Why> {
+    /// [`Emulated`]: whether a step reading other lanes may meet the wave's
+    /// other half through group-shared memory in DXIL block `at`, which IR
+    /// block `ir` lowers to.
+    ///
+    /// A group barrier needs every thread of the group to reach it, so the
+    /// halves only meet where the block post-dominates the entry. In
+    /// lane-dependent code they go through the fence alone: each lane sees
+    /// its own half (which is the same hardware wave) and the other half's
+    /// console lanes read as 0, rather than a barrier that would never
+    /// complete and hang the host's GPU.
+    fn emulated_here(&self, ir: usize, at: usize) -> bool {
         let em = self.emulated.as_ref().expect("emulated");
-        if !em.uniform[ir] || at == self.cur && self.guard_depth > 0 {
-            return Err("a step across lanes in lane-dependent code on a host \
-                        without 64-lane waves");
-        }
-        Ok(())
+        em.uniform[ir] && !(at == self.cur && self.guard_depth > 0)
     }
 
-    /// [`Emulated`]: the exchange slot of console lane `lane` (modulo 64),
-    /// addressed in `at`.
+    /// A group-shared memory fence alone (no execution sync), in `at`.
+    fn tgsm_fence(&mut self, at: usize) {
+        let mode = if self.writes_uavs { 1 | 2 } else { 1 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// [`Emulated`]: the exchange slot of console lane `lane` in this
+    /// thread's console wave, addressed in `at`.
     fn slot(&mut self, at: usize, lane: V) -> V {
         let g = match self.emulated.as_ref().and_then(|e| e.slots) {
             Some(g) => g,
             None => {
-                let arr = self.s.m.array(64, self.s.t.i32);
+                // One wave's slots per console wave of the group.
+                let threads = self
+                    .s
+                    .threads
+                    .map(|t| t.iter().product::<u32>())
+                    .unwrap_or(64);
+                let slots = threads.max(64).div_ceil(64) * 64;
+                let arr = self.s.m.array(slots, self.s.t.i32);
                 let g = self.s.m.global("xlane", arr, 3);
                 self.emulated.as_mut().expect("emulated").slots = Some(g);
                 g
             }
         };
+        let t = self.mesh_thread();
+        let hi = self.s.m.i32(!63u32);
+        let base = self.s.m.bin(at, Bin::And, t, hi);
         let k63 = self.s.m.i32(63);
-        let i = self.s.m.bin(at, Bin::And, lane, k63);
+        let lane = self.s.m.bin(at, Bin::And, lane, k63);
+        let i = self.s.m.bin(at, Bin::Or, base, lane);
         self.s.m.element(at, g, i)
     }
 
@@ -2410,21 +2487,62 @@ impl<'a> Lower<'a> {
     }
 
     /// [`Emulated`]: every console lane's `x`, lane 0 first, in `at`.
-    fn gather(&mut self, at: usize, x: V) -> Vec<V> {
+    ///
+    /// With `sync` the group's threads meet at group barriers; without it
+    /// (a lane-dependent step, see [`Self::emulated_here`]) they only fence,
+    /// and the console lanes of the other half read as 0.
+    fn gather(&mut self, at: usize, x: V, sync: bool) -> Vec<V> {
         let me = self.mesh_thread();
         let p = self.slot(at, me);
         self.s.m.store(at, p, x);
-        self.group_sync(at);
+        if sync {
+            self.group_sync(at);
+        } else {
+            self.tgsm_fence(at);
+        }
         let lanes = self.emulated.as_ref().expect("emulated").lanes;
+        let threads = self.threads();
+        let half = if sync { None } else { Some(self.half()) };
         let out = (0..lanes)
             .map(|n| {
+                // A console lane the group does not have wrote nothing.
+                if n >= threads {
+                    return self.s.m.i32(0);
+                }
                 let k = self.s.m.i32(n);
                 let q = self.slot(at, k);
-                self.s.m.load(at, q)
+                let v = self.s.m.load(at, q);
+                let Some(half) = half else {
+                    return v;
+                };
+                let n = self.s.m.i32(n / 32);
+                let mine = self.s.m.cmp(at, pred::EQ, half, n);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(at, mine, v, zero)
             })
             .collect();
-        self.group_sync(at);
+        if sync {
+            self.group_sync(at);
+        }
         out
+    }
+
+    /// The threads of one group of this program's stage.
+    fn threads(&self) -> u32 {
+        self.s
+            .threads
+            .map(|t| t.iter().product::<u32>())
+            .unwrap_or(64)
+    }
+
+    /// The 32-lane half of its console wave this thread runs in.
+    fn half(&mut self) -> V {
+        let at = self.cur;
+        let t = self.mesh_thread();
+        let five = self.s.m.i32(5);
+        let one = self.s.m.i32(1);
+        let s = self.s.m.bin(at, Bin::LShr, t, five);
+        self.s.m.bin(at, Bin::And, s, one)
     }
 
     /// The float value of a register value.
@@ -2520,10 +2638,19 @@ impl<'a> Lower<'a> {
         }
         if self.emulated.is_some() {
             // The console's lanes reach each LDS access together; the
-            // host's two waves wait for each other before one.
-            let at = self.cur;
-            self.emulated_here(self.cur_ir, at)?;
-            self.group_sync(at);
+            // host's two waves wait for each other before one. A block the
+            // console's allocation request runs in is reached by one lane
+            // alone, and a lane-dependent block only some lanes reach: in
+            // both a barrier would never complete (those accesses take
+            // their chance without one).
+            if !self.no_barrier.contains(&self.cur_ir) {
+                let at = self.cur;
+                if self.emulated_here(self.cur_ir, at) {
+                    self.group_sync(at);
+                } else {
+                    self.tgsm_fence(at);
+                }
+            }
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
@@ -7495,6 +7622,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_wave64: false,
         })
     }
 

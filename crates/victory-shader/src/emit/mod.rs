@@ -822,9 +822,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.code, native.wave64, native.vgprs)?;
-        let res = resource::track(&p, &native.layout, native.stage)?;
-        let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         emit(&c, &native, &p, &st, &io, &res)
