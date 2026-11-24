@@ -324,6 +324,29 @@ fn wave_lanes_unsupported(
     stage == "mesh" && console_wave64 && host_max < 64
 }
 
+/// Whether console wave64 mesh programs may run as two 32-lane halves anyway
+/// (diagnostics, `VICTORY_WAVE64_MESH`).
+///
+/// The title's mesh programs carry no cross-lane operations past
+/// `WaveReadLaneFirst`, so a 32-lane host can run them; a console mesh
+/// program that does wait on another half's lanes would hang.
+fn mesh_wave64_allowed() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALLOWED.get_or_init(|| {
+            std::env::var_os("VICTORY_WAVE64_MESH").is_some_and(|value| {
+                let value = value.to_string_lossy().to_ascii_lowercase();
+                !matches!(value.as_str(), "" | "0" | "false" | "off")
+            })
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -371,22 +394,32 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
+        let mesh_anyway = mesh_wave64_allowed();
         if let Some(ms) = mesh
             && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
         {
-            return refuse(
-                if host_lanes.1 < 32 {
-                    "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
-                } else {
-                    "a mesh program written for 64-lane waves, on a host without them"
-                },
-                shaders,
+            if !mesh_anyway {
+                return refuse(
+                    if host_lanes.1 < 32 {
+                        "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
+                    } else {
+                        "a mesh program written for 64-lane waves, on a host without them"
+                    },
+                    shaders,
+                );
+            }
+            tracing::warn!(
+                ?shaders,
+                "a mesh program written for 64-lane waves runs as two 32-lane halves (VICTORY_WAVE64_MESH)"
             );
         }
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
             if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
+                if s.stage == "mesh" && mesh_anyway {
+                    continue;
+                }
                 return refuse(
                     if host_lanes.1 < 32 {
                         "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
