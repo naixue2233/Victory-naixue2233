@@ -237,6 +237,28 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name,
+/// for formats PC D3D12 forbids as one or the other: `R16G16B16A16_FLOAT`
+/// (10) for `R9G9B9E5_SHAREDEXP` (67), and `R8G8B8A8_UNORM` (28), the same
+/// channels with more bits, for `B5G5R5A1_UNORM` (86, no unordered access)
+/// and `B4G4R4A4_UNORM` (115, no render target); else [`pc_format`].
+/// Textures only sampled keep their format. The host refused these
+/// textures outright before (upstream #735, #741): the title's resource was
+/// null.
+pub(crate) fn target_format(format: u32) -> u32 {
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const RGBA16_FLOAT: u32 = 10;
+    const B5G5R5A1_UNORM: u32 = 86;
+    const B4G4R4A4_UNORM: u32 = 115;
+    const RGBA8_UNORM: u32 = 28;
+    match pc_format(format) {
+        R9G9B9E5_SHAREDEXP => RGBA16_FLOAT,
+        B5G5R5A1_UNORM | B4G4R4A4_UNORM => RGBA8_UNORM,
+        format => format,
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -316,20 +338,34 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
+    /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
+    /// pitched but the last.
+    pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        if lines == 0 {
+            return Some((0, row_bytes, 0));
+        }
+        let total = u64::from(self.row_pitch)
+            .checked_mul(lines - 1)?
+            .checked_add(row_bytes)?;
+        Some((lines, row_bytes, total))
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        self.layout().map(|(_, _, total)| total)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1840,5 +1876,76 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn r9g9b9e5_target_format_substitutes_rgba16f() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(target_format(67), 10);
+        assert_eq!(target_format(28), 28);
+        assert_eq!(target_format(118), 45);
+    }
+
+    #[test]
+    fn small_unorm_targets_substitute_rgba8() {
+        assert_eq!(target_format(86), 28);
+        assert_eq!(target_format(115), 28);
+        // Sampled copies keep their format; B5G6R5 renders on PC.
+        assert_eq!(pc_format(86), 86);
+        assert_eq!(target_format(85), 85);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn substituted_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex_desc = |flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        for (format, flags, expected_host_format) in [
+            (67, 0, 67),
+            (67, 4, 10),
+            (67, 5, 10),
+            // B5G5R5A1 has no unordered access on PC, B4G4R4A4 no render
+            // target (upstream #735).
+            (86, 0, 86),
+            (86, 5, 28),
+            (115, 1, 28),
+        ] {
+            let d = ResourceDesc {
+                format,
+                ..tex_desc(flags)
+            };
+            let mut out = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK, "format {format} flags {flags}");
+            let host = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            let got = unsafe { host.GetDesc() }.Format.0 as u32;
+            assert_eq!(got, expected_host_format, "format {format} flags {flags}");
+            assert_eq!(view_format(out), None, "format {format} flags {flags}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 }

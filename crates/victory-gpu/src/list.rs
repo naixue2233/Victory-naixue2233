@@ -436,6 +436,38 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether host formats `a` and `b` can meet in one copy: the same family.
+/// A render target or UAV texture whose console format PC forbids is made
+/// in another format (`resource::target_format`); a copy between it and a
+/// texture of the title's own format would be refused by the runtime, so it
+/// is skipped.
+#[cfg(any(windows, test))]
+fn same_family(a: u32, b: u32) -> bool {
+    let ok = a == b || crate::resource::family(a) == crate::resource::family(b);
+    if !ok {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                a,
+                b,
+                "texture copy between formats of different families skipped (a substituted target)",
+            );
+        });
+    }
+    ok
+}
+
+/// [`same_family`] for two host resources.
+#[cfg(windows)]
+fn copyable(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (to.GetDesc().Format.0, from.GetDesc().Format.0) };
+    same_family(a as u32, b as u32)
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -446,6 +478,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if !copyable(to, from) {
+                return;
+            }
+            // A texture the title fills through memory has its contents in
+            // the staging copy until an upload records them.
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -506,6 +543,83 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        const _: () =
+            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        if dst.kind == FOOTPRINT {
+            if src.kind == FOOTPRINT {
+                return;
+            }
+            let (Some(_host), Some(from_tex)) = (
+                crate::host::host(),
+                crate::resource::host_resource(src.resource),
+            ) else {
+                return;
+            };
+            let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
+                return;
+            };
+            let host_format = crate::resource::pc_format(dst.footprint.format);
+            if crate::resource::element(host_format)
+                != crate::resource::element(dst.footprint.format)
+            {
+                // Console formats such as 118..=120 (3-byte D16S8) map to
+                // 4-byte PC substitutes (45..=47): raw readback would mis-size
+                // the staging buffer and write the wrong texel layout.
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        format = dst.footprint.format,
+                        host_format,
+                        "texture-to-buffer readback skipped: host format has a different texel size",
+                    );
+                });
+                return;
+            }
+            // SAFETY: a live texture.
+            let from_format = unsafe { from_tex.GetDesc() }.Format.0 as u32;
+            if !same_family(from_format, host_format) {
+                return;
+            }
+            if total == 0 || lines == 0 || row_bytes == 0 {
+                return;
+            }
+            let dst_pitch = u64::from(dst.footprint.row_pitch);
+            if lines > 1 && dst_pitch < row_bytes {
+                return;
+            }
+            let Some(target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
+                return;
+            };
+            let Ok(row_bytes_u32) = u32::try_from(row_bytes) else {
+                return;
+            };
+            // D3D12 requires placed footprints' row pitch to be 256-byte aligned.
+            let host_pitch = dst
+                .footprint
+                .row_pitch
+                .max(row_bytes_u32)
+                .next_multiple_of(256);
+            let Some(staging_bytes) = u64::from(host_pitch)
+                .checked_mul(lines - 1)
+                .and_then(|n| n.checked_add(row_bytes))
+            else {
+                return;
+            };
+            // A readback of a substituted target needs a staging copy
+            // pitched to the host format, and this host has no
+            // texture-to-buffer copy yet, so it stays skipped.
+            let _ = (staging_bytes, lines, row_bytes, total);
+            static SKIP_ONCE: std::sync::Once = std::sync::Once::new();
+            SKIP_ONCE.call_once(|| {
+                tracing::warn!(
+                    format = dst.footprint.format,
+                    host_format,
+                    "texture-to-buffer readback skipped: no host texture-to-buffer copy",
+                );
+            });
+            return;
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
@@ -540,6 +654,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if !copyable(to, texture) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -1404,6 +1521,86 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A texture made in a substituted target format meets only its own
+    /// family in a copy (upstream #735): RGBA8 and its typeless and sRGB
+    /// twins copy, the title's B5G5R5A1 or R9G9B9E5 textures do not.
+    #[test]
+    fn copies_stay_within_a_format_family() {
+        use crate::resource::target_format;
+        assert!(same_family(28, 28));
+        assert!(same_family(27, 29));
+        assert!(same_family(10, 2 + 8));
+        assert!(!same_family(target_format(86), 86));
+        assert!(!same_family(target_format(115), 115));
+        assert!(!same_family(target_format(67), 67));
+        assert!(same_family(86, 86));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_list_creation_keeps_the_initial_pipeline() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+        use windows::core::Interface;
+
+        let null = std::ptr::null();
+        let iid = ID3D12PipelineState::IID;
+        // SAFETY: ComputeHead contains only raw pointers and a byte count. No
+        // shader is needed to verify which pipeline object the list remembers.
+        let desc: crate::pipeline::ComputeHead = unsafe { std::mem::zeroed() };
+        let mut pipeline = null;
+        let mut allocator = null;
+        assert_eq!(
+            crate::pipeline::create_compute(null, &desc, (&raw const iid).cast(), &mut pipeline),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let bound = |list: This| {
+            // SAFETY: the test owns this live command list.
+            unsafe { &*list.cast::<List>() }
+                .state
+                .lock()
+                .unwrap()
+                .current_pipeline()
+        };
+        let created_with = [false, true].map(|extended| {
+            let mut list = null;
+            let hr = if extended {
+                create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], &mut list)
+            } else {
+                create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], &mut list)
+            };
+            assert_eq!(hr, S_OK);
+            let initial = bound(list);
+            if host_list(list).is_some() {
+                assert_eq!(close(list), S_OK);
+                assert_eq!(reset_x(list, allocator, null, 0), S_OK);
+                assert_eq!(bound(list), null);
+                assert_eq!(close(list), S_OK);
+                assert_eq!(reset(list, allocator, pipeline), S_OK);
+                assert_eq!(bound(list), pipeline);
+            }
+            assert_eq!(release(list), 0);
+            initial
+        });
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(pipeline), 0);
+        assert_eq!(
+            created_with,
+            [pipeline, pipeline],
+            "initial PSO for CreateCommandList and CreateCommandListX"
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
