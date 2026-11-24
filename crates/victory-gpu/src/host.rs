@@ -184,6 +184,27 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Lane counts: without 64-lane waves (NVIDIA, Intel) the translation
+        // runs the console's 64-lane waves through group-shared memory where
+        // it can (victory_shader::emit::host_wave64). Set before the first
+        // translation, which the shader cache's key includes.
+        let mut lanes = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut lanes).cast(),
+                size_of_val(&lanes) as u32,
+            )
+            .is_ok()
+        {
+            victory_shader::emit::set_host_wave64(lanes.WaveLaneCountMin, lanes.WaveLaneCountMax);
+            tracing::info!(
+                min = lanes.WaveLaneCountMin,
+                max = lanes.WaveLaneCountMax,
+                wave64 = victory_shader::emit::host_wave64(),
+                "host wave lanes"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

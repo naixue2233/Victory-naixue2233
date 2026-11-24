@@ -91,6 +91,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_fixtures;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -136,6 +138,28 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         _ => lower::LOOP_LIMIT,
     }
 }
+
+/// Whether the host device runs 64-lane waves (`WaveSize(64)`): set once,
+/// before the first translation, by whoever creates the host device
+/// ([`set_host_wave64`]); true until then. AMD's RDNA GPUs do; NVIDIA's
+/// and Intel's have 32 lanes (or fewer) and refuse a pipeline that
+/// declares 64. Without them a compute program that needs the console's
+/// 64 lanes runs its cross-lane steps through group-shared memory when its
+/// group is that one wave, and is refused with a reason otherwise. The
+/// value is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn host_wave64() -> bool {
+    HOST_WAVE64.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`host_wave64`] from the host device's lane counts
+/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMin/Max`).
+pub fn set_host_wave64(min_lanes: u32, max_lanes: u32) {
+    let yes = (min_lanes..=max_lanes).contains(&64);
+    HOST_WAVE64.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+static HOST_WAVE64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +312,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_wave64: host_wave64(),
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -745,5 +770,101 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// Translates a one-lane compute program that copies root constants
+    /// s0..s3 to v1..v4, runs `body` and stores v0 to a raw UAV (the frame
+    /// of the GPU tests in `valu_tests`), so a value `body` cannot produce
+    /// stops the translation.
+    fn translate_stored(body: &[u32]) -> Result<HostShader, ShaderError> {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        for i in 0..4 {
+            words.push(0x7E00_0200 | (i + 1) << 17 | i); // v_mov_b32 v(i+1), s(i)
+        }
+        words.extend_from_slice(body);
+        // buffer_store_dword v0, off, s[8:11], 0; s_endpgm
+        words.extend_from_slice(&[0xE070_0000, 0x8002_0000, 0xBF81_0000]);
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Constants, 4, 0, 0),
+                param(RootType::Table, 1, 4, 1),
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// The 64-bit multiply-adds of 32-bit operands translate, both halves
+    /// of the result and the unsigned form's carry; reading the signed
+    /// form's carry, which is not modelled, is refused with a reason.
+    #[test]
+    fn mad_64_of_32_bit_operands_translates() {
+        for op in [0x176u32, 0x177] {
+            // v_mad_{u64_u32,i64_i32} v[5:6], vcc_lo, v1, v2, v[3:4]
+            let mad = [0xD400_6A05 | op << 16, 0x040E_0501];
+            for mov in [0x7E00_0305, 0x7E00_0306] {
+                // v_mov_b32 v0, v5 / v6
+                translate_stored(&[mad[0], mad[1], mov]).unwrap();
+            }
+            // v_cndmask_b32 v0, 0, 1, vcc_lo
+            let carry = translate_stored(&[mad[0], mad[1], 0xD501_0000, 0x01A9_0280]);
+            if op == 0x176 {
+                carry.unwrap();
+            } else {
+                assert!(
+                    matches!(carry, Err(ShaderError::Unsupported { .. })),
+                    "{carry:?}"
+                );
+            }
+        }
+    }
+
+    /// v_ldexp_f32, v_frexp_mant_f32 and v_frexp_exp_i32_f32 translate.
+    #[test]
+    fn ldexp_and_frexp_translate() {
+        // v_ldexp_f32 v0, v1, v2
+        translate_stored(&[0xD762_0000, 0x0002_0501]).unwrap();
+        // v_frexp_mant_f32 v0, v1; v_frexp_exp_i32_f32 v0, v1
+        translate_stored(&[0x7E00_8101]).unwrap();
+        translate_stored(&[0x7E00_7F01]).unwrap();
+        // VOP3 forms with |v1| and -v1.
+        translate_stored(&[0xD5C0_0100, 0x0000_0101]).unwrap();
+        translate_stored(&[0xD5BF_0000, 0x2000_0101]).unwrap();
     }
 }

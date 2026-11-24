@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave64: true,
     })
     .expect("lower");
 
@@ -936,4 +937,265 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// VOP3B `op vdst, sdst, src0, src1, src2` (no modifiers).
+const fn vop3b(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | (sdst as u32 & 0x7F) << 8, w1]
+}
+
+/// 32 × 32-bit inputs where the product or the 64-bit addend reach their
+/// extremes, so both the multiply and the add wrap.
+const MAD64_CASES: &[[u32; 4]] = &[
+    [0, 0, 0, 0],
+    [1, 1, 0, 0],
+    [0xffff_ffff, 0xffff_ffff, 0, 0],
+    [0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff],
+    [0xffff_ffff, 0xffff_ffff, 0x0000_0002, 0],
+    [0x8000_0000, 0x8000_0000, 0, 0x8000_0000],
+    [0x8000_0000, 0x7fff_ffff, 0x1234_5678, 0x9abc_def0],
+    [0x7fff_ffff, 0x7fff_ffff, 0xffff_ffff, 0x7fff_ffff],
+    [0xffff_fffe, 3, 1, 0],
+    [0x0001_0000, 0x0001_0000, 0xffff_ffff, 0xffff_ffff],
+    [0xdead_beef, 0x1337_c0de, 0x0bad_f00d, 0xfeed_face],
+];
+
+/// The 64-bit result and the carry out of the addition (unsigned form).
+fn mad64(inp: [u32; 4], signed: bool) -> (u64, bool) {
+    let addend = u64::from(inp[2]) | u64::from(inp[3]) << 32;
+    let product = if signed {
+        (i64::from(inp[0] as i32) * i64::from(inp[1] as i32)) as u64
+    } else {
+        u64::from(inp[0]) * u64::from(inp[1])
+    };
+    product.overflowing_add(addend)
+}
+
+#[test]
+fn v_mad_u64_u32_and_v_mad_i64_i32_match_rdna2() {
+    // v_mad_{u64_u32,i64_i32} v[5:6], vcc_lo, v1, v2, v[3:4] (VOP3B 0x176,
+    // 0x177), then v_mov_b32 v0, v5 (low dword) or v6 (high dword).
+    for (op, signed, form) in [
+        (0x176, false, "v_mad_u64_u32"),
+        (0x177, true, "v_mad_i64_i32"),
+    ] {
+        let mad = vop3b(op, 5, 106, vgpr(1), vgpr(2), vgpr(3));
+        for (half, reg) in [("low", 5), ("high", 6)] {
+            let shader = build_valu_cs(&[mad[0], mad[1], vop1(0x001, 0, vgpr(reg))]);
+            run_cases(&shader, MAD64_CASES, |backend, _, inp, got| {
+                let r = mad64(inp, signed).0;
+                let want = if reg == 5 { r as u32 } else { (r >> 32) as u32 };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {form}({:#x}, {:#x}, {:#x}{:08x}) {half} = {got:#010x}, \
+                     want {want:#010x}",
+                    inp[0], inp[1], inp[3], inp[2],
+                );
+            });
+        }
+    }
+    // The unsigned form's carry out: v_cndmask_b32 v0, 0, 1, vcc_lo.
+    let mad = vop3b(0x176, 5, 106, vgpr(1), vgpr(2), vgpr(3));
+    let pick = vop3(0x101, 0, 128, 129, 106);
+    let shader = build_valu_cs(&[mad[0], mad[1], pick[0], pick[1]]);
+    run_cases(&shader, MAD64_CASES, |backend, _, inp, got| {
+        let want = u32::from(mad64(inp, false).1);
+        assert_eq!(
+            got, want,
+            "{backend}: v_mad_u64_u32({:#x}, {:#x}, {:#x}{:08x}) carry = {got}, want {want}",
+            inp[0], inp[1], inp[3], inp[2],
+        );
+    });
+}
+
+/// f32 bits of values whose significand and exponent RDNA2 returns exactly:
+/// zeros, infinities, NaNs, normals at both ends of the range and
+/// denormals (normalized: v_frexp works on the bits).
+const FREXP_CASES: &[u32] = &[
+    0x0000_0000, // +0
+    0x8000_0000, // -0
+    0x7f80_0000, // +inf
+    0xff80_0000, // -inf
+    0x7fc0_0000, // NaN
+    0xffc0_0001, // NaN with a payload
+    0x3f80_0000, // 1.0
+    0xbf80_0000, // -1.0
+    0x3eff_ffff, // just below 0.5
+    0x4049_0fdb, // pi
+    0x0080_0000, // smallest normal
+    0x7f7f_ffff, // largest finite
+    0xff7f_ffff,
+    0x0000_0001, // smallest denormal
+    0x8000_0001,
+    0x007f_ffff, // largest denormal
+    0x0040_0000,
+    0x0000_ffff,
+];
+
+/// (significand bits, exponent) as RDNA2's v_frexp_mant_f32 and
+/// v_frexp_exp_i32_f32 give them.
+fn frexp_ref(x: u32) -> (u32, i32) {
+    let field = (x >> 23 & 0xFF) as i32;
+    let frac = x & 0x7F_FFFF;
+    if x & 0x7FFF_FFFF == 0 || field == 0xFF {
+        return (x, 0);
+    }
+    let (frac, e) = if field == 0 {
+        let lz = frac.leading_zeros();
+        ((frac << (lz - 8)) & 0x7F_FFFF, -117 - lz as i32)
+    } else {
+        (frac, field - 126)
+    };
+    (x & 0x8000_0000 | 0x3F00_0000 | frac, e)
+}
+
+#[test]
+fn v_frexp_mant_and_exp_f32_match_rdna2() {
+    let cases: Vec<[u32; 4]> = FREXP_CASES.iter().map(|&x| [x, 0, 0, 0]).collect();
+    // Every case: the significand times 2^exponent gives the input back.
+    for &x in FREXP_CASES {
+        let (m, e) = frexp_ref(x);
+        let back = f64::from(f32::from_bits(m)) * 2f64.powi(e);
+        let want = f64::from(f32::from_bits(x));
+        assert!(back == want || want.is_nan(), "{x:#010x}");
+    }
+    // v_frexp_mant_f32 v0, v1 (VOP1 0x40)
+    let mant = build_valu_cs(&[vop1(0x040, 0, vgpr(1))]);
+    run_cases(&mant, &cases, |backend, _, inp, got| {
+        let want = frexp_ref(inp[0]).0;
+        assert_eq!(
+            got, want,
+            "{backend}: v_frexp_mant_f32({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    // v_frexp_exp_i32_f32 v0, v1 (VOP1 0x3f)
+    let exp = build_valu_cs(&[vop1(0x03f, 0, vgpr(1))]);
+    run_cases(&exp, &cases, |backend, _, inp, got| {
+        let want = frexp_ref(inp[0]).1;
+        assert_eq!(
+            got as i32, want,
+            "{backend}: v_frexp_exp_i32_f32({:#010x}) = {}, want {want}",
+            inp[0], got as i32,
+        );
+    });
+}
+
+#[test]
+fn v_ldexp_f32_scales_by_any_exponent() {
+    // v_ldexp_f32 v0, v1, v2 (VOP3 0x362). Results stay normal (or zero,
+    // or infinity) so the host's denormal mode cannot change them.
+    let shader = build_valu_cs(&vop3(0x362, 0, vgpr(1), vgpr(2), 0));
+    let inf = f32::INFINITY.to_bits();
+    let cases: &[(u32, i32, u32)] = &[
+        (1.0f32.to_bits(), 0, 1.0f32.to_bits()),
+        (1.0f32.to_bits(), 127, 0x7f00_0000),
+        (1.0f32.to_bits(), 128, inf),
+        (1.0f32.to_bits(), -126, 0x0080_0000),
+        (1.5f32.to_bits(), -1, 0.75f32.to_bits()),
+        ((-3.0f32).to_bits(), 4, (-48.0f32).to_bits()),
+        // Exponents past what one power-of-two factor holds.
+        (0x0080_0000, 253, 0x7f00_0000),
+        (0x7f00_0000, -253, 0x0080_0000),
+        (0x0080_0000, 254, inf),
+        (0x7f7f_ffff, -253, 0x00ff_ffff),
+        // Overflow and underflow from any finite nonzero input.
+        (0x0080_0000, i32::MAX, inf),
+        ((-1.0e-30f32).to_bits(), 1000, 0xff80_0000),
+        (0x7f7f_ffff, i32::MIN, 0),
+        ((-0.5f32).to_bits(), -400, 0x8000_0000),
+        // Zeros, infinities and NaN keep their value.
+        (0x8000_0000, 1000, 0x8000_0000),
+        (inf, -1000, inf),
+        (0xff80_0000, 0, 0xff80_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, e, _)| [x, e as u32, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_ldexp_f32({:#010x}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1] as i32,
+        );
+    });
+    run_cases(&shader, &[[0x7fc0_0000, 10, 0, 0]], |backend, _, _, got| {
+        assert!(f32::from_bits(got).is_nan(), "{backend}: {got:#010x}");
+    });
+}
+
+/// Translates a 64-thread wave64 program from `wave64_fixtures` for a host
+/// without 64-lane waves (lane exchanges through group-shared memory) and
+/// checks what its group stores on every available SM 6.6 host. The
+/// translation declares no wave size, so it runs on any GPU: on NVIDIA's
+/// 32-lane waves this is the only way these programs run at all.
+fn run_wave64_group(body: &[u32], lds_bytes: u32, expected: &[u32]) {
+    use super::wave64_fixtures::{lower_for, program};
+    let lowered = lower_for(&program(body, 64, lds_bytes), false).expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) | (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (n, (&got, &want)) in out[0].iter().zip(expected).enumerate() {
+            assert_eq!(
+                got,
+                want,
+                "{label}: dword {n} (lane {}, result {}) = {got:#x}, want {want:#x}",
+                n % 64,
+                n / 64,
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn wave64_lane_reads_ballots_and_lds_run_without_64_lane_waves() {
+    use super::wave64_fixtures::{CROSS_LANE, cross_lane_expected};
+    run_wave64_group(CROSS_LANE, 512, &cross_lane_expected());
+}
+
+#[test]
+fn wave64_dpp_first_lane_and_swizzle_run_without_64_lane_waves() {
+    use super::wave64_fixtures::{DPP_FIRST_SWIZZLE, dpp_first_swizzle_expected};
+    run_wave64_group(DPP_FIRST_SWIZZLE, 0, &dpp_first_swizzle_expected());
 }
