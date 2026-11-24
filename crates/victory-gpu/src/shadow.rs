@@ -153,7 +153,30 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
-        let (from, to) = self.inside(address, len);
+    }
+
+    /// Before the submission runs: the bytes of every range its shaders
+    /// declared ([`Shadow::writing`]) as they are now, in one copy of their
+    /// union. Taken here and not per declaration because growing the
+    /// snapshot a range at a time re-copied all of it: the world declares
+    /// dozens of scattered views of its 174 MB heap per submission, and
+    /// that growth was seconds of every world frame.
+    pub(crate) fn take_before(&self) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let span: Option<(usize, usize)> = pending.iter().fold(None, |span, &(address, end)| {
+            let (from, to) = self.inside(address, end - address);
+            Some(match span {
+                Some((a, b)) => (a.min(from), b.max(to)),
+                None => (from, to),
+            })
+        });
+        let Some((from, to)) = span else {
+            return;
+        };
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,6 +189,7 @@ impl Shadow {
         {
             return;
         }
+        let started = std::time::Instant::now();
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
         match before.take() {
@@ -177,6 +201,13 @@ impl Shadow {
             }
             None => grown.extend_from_slice(host(start, end)),
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Snapshot, grown.len() as u64);
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+        }
+        let _ = started;
         *before = Some((start, grown));
     }
 

@@ -571,6 +571,31 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // The bytes shaders write go back after the submission; each range
+        // once per submission, however many dispatches declared it (the
+        // world's passes declare the same big ranges dozens of times). Their
+        // snapshot is taken here, once for the whole submission, and not as
+        // each declaration comes (see `Shadow::take_before`).
+        type Ranges = Vec<(usize, usize)>;
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let range = (*address, *len);
+                    match back
+                        .iter_mut()
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                    {
+                        Some((_, ranges)) if !ranges.contains(&range) => ranges.push(range),
+                        Some(_) => {}
+                        None => back.push((shadow.clone(), vec![range])),
+                    }
+                }
+            }
+        }
+        for (shadow, _) in &back {
+            shadow.take_before();
+        }
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -640,22 +665,6 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        // By copy: its ranges go back together, overlapping ones merged.
-        type Ranges = Vec<(usize, usize)>;
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
-                    let range = (*address, *len);
-                    match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) if !ranges.contains(&range) => ranges.push(range),
-                        Some(_) => {}
-                        None => back.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
         for (shadow, ranges) in &back {
             let written = shadow.copy_back(ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -1302,21 +1311,56 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    /// Ranges still to refresh, disjoint and each queued once: the world
+    /// asks for scattered views of the same big buffers thousands of times
+    /// per frame, and one bounding span per copy re-checked the whole span
+    /// each time (hundreds of MB per submission, 97% of it unchanged).
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Ranges already refreshed in this submission since the last title
+    /// write through the batch: asking again for bytes already copied is a
+    /// no-op.
+    refreshed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+}
+
+/// The parts of `[from, to)` no range of `shadow` in `ranges` covers.
+fn uncovered(
+    ranges: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    from: usize,
+    to: usize,
+) -> Vec<(usize, usize)> {
+    let mut pieces = vec![(from, to)];
+    for (s, a, b) in ranges {
+        if !std::sync::Arc::ptr_eq(s, shadow) {
+            continue;
+        }
+        let mut next = Vec::with_capacity(pieces.len() + 1);
+        for (f, t) in pieces {
+            if *b <= f || *a >= t {
+                next.push((f, t));
+                continue;
+            }
+            if *a > f {
+                next.push((f, *a));
+            }
+            if *b < t {
+                next.push((*b, t));
+            }
+        }
+        pieces = next;
+    }
+    pieces
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+        for (from, to) in uncovered(&self.refreshed, shadow, address, end) {
+            for (from, to) in uncovered(&self.refreshes, shadow, from, to) {
+                self.refreshes.push((shadow.clone(), from, to));
+            }
         }
     }
 
@@ -1330,6 +1374,7 @@ impl Batch {
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
+        self.refreshed.clear();
         self.textures.clear();
     }
 
@@ -1344,7 +1389,11 @@ impl Batch {
             .into_iter()
             .partition(|&(_, from, to)| from < end && dst < to);
         self.refreshes = later;
-        Self::run(now);
+        self.run(now);
+        // The bytes just written changed under the ranges refreshed before
+        // it: those are asked for again.
+        self.refreshed
+            .retain(|&(_, from, to)| !(from < end && dst < to));
         self.textures.clear();
     }
 
@@ -1365,14 +1414,15 @@ impl Batch {
                 std::sync::Arc::ptr_eq(s, shadow) && *from < end && address < *to
             });
         self.refreshes = later;
-        Self::run(now);
+        self.run(now);
     }
 
     fn flush(&mut self) {
-        Self::run(std::mem::take(&mut self.refreshes));
+        let now = std::mem::take(&mut self.refreshes);
+        self.run(now);
     }
 
-    fn run(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    fn run(&mut self, refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
         for (shadow, from, to) in refreshes {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -1381,6 +1431,7 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            self.refreshed.push((shadow, from, to));
         }
     }
 }
