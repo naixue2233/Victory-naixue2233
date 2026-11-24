@@ -77,6 +77,9 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let hex = full.to_hex();
+    #[cfg(feature = "diagnostics")]
+    dump(&hex[..16], bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
@@ -84,13 +87,36 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash: hex[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+/// Writes a container to `VICTORY_DUMP_SHADERS`, once per content hash
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn dump(hash: &str, bytes: &[u8]) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = std::env::var_os("VICTORY_DUMP_SHADERS").map(std::path::PathBuf::from)?;
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot make the shader dump directory");
+            return None;
+        }
+        Some(dir)
+    });
+    let Some(dir) = dir else { return };
+    let path = dir.join(format!("{hash}.container"));
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, bytes) {
+        tracing::warn!(path = %path.display(), error = %e, "cannot dump a shader container");
+    }
 }
 
 /// A translated shader and the console resources its code reads.
