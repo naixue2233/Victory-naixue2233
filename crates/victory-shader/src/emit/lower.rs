@@ -2402,7 +2402,7 @@ impl<'a> Lower<'a> {
             }
             // The other half of the console wave runs as another wave here:
             // its lanes hold nothing this one can read.
-            let half = self.half();
+            let half = self.half(at);
             let five = self.s.m.i32(5);
             let theirs = self.s.m.bin(at, Bin::LShr, lane, five);
             let same = self.s.m.cmp(at, pred::EQ, half, theirs);
@@ -2502,7 +2502,7 @@ impl<'a> Lower<'a> {
         }
         let lanes = self.emulated.as_ref().expect("emulated").lanes;
         let threads = self.threads();
-        let half = if sync { None } else { Some(self.half()) };
+        let half = if sync { None } else { Some(self.half(at)) };
         let out = (0..lanes)
             .map(|n| {
                 // A console lane the group does not have wrote nothing.
@@ -2536,8 +2536,7 @@ impl<'a> Lower<'a> {
     }
 
     /// The 32-lane half of its console wave this thread runs in.
-    fn half(&mut self) -> V {
-        let at = self.cur;
+    fn half(&mut self, at: usize) -> V {
         let t = self.mesh_thread();
         let five = self.s.m.i32(5);
         let one = self.s.m.i32(1);
