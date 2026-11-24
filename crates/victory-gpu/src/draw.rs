@@ -1183,14 +1183,26 @@ fn describe(view: Option<&View>) -> String {
         ),
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
+            if *size >= 16 && let Some(w) = first_words(*address) =>
         {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
+            let v: [f32; 4] = std::array::from_fn(|i| {
+                f32::from_le_bytes(w[4 * i..4 * i + 4].try_into().unwrap_or_default())
+            });
             format!("Constant({address:#x}, {size}) {v:?}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// The first 16 bytes of title memory at `at`, if readable. Read through
+/// the kernel, which fails on an unmapped page: asking `VirtualQuery`
+/// first walks the title's big pools' pages, about a millisecond each, and
+/// a world frame's command texts asked it thousands of times (seconds per
+/// frame on each recording thread with device-removed data on).
+#[cfg(feature = "diagnostics")]
+fn first_words(at: u64) -> Option<[u8; 16]> {
+    let mut w = [0u8; 16];
+    (at != 0 && crate::host::read_into(at as *const u8, &mut w)).then_some(w)
 }
 
 /// The console's own primitive topologies.
