@@ -105,15 +105,21 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(PORTABLE_VIEWS) {
+            // A capped heap: the world's fresh tables need the full dynamic
+            // range or most indirect draws and mesh dispatches drop as "a
+            // descriptor table without dynamic slots" (#747: 2^18 dropped
+            // none), so the title's slots are cut to make room for it.
+            tracing::warn!(
+                count,
+                "host view heap capped at {PORTABLE_VIEWS}; dynamic slots kept, \
+                 title slots cut to {}",
+                PORTABLE_VIEWS - DYNAMIC
+            );
+            (heap, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
         } else {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
