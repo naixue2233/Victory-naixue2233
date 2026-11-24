@@ -306,7 +306,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -858,7 +858,12 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -875,7 +880,11 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {

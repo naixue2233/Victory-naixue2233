@@ -545,7 +545,7 @@ extern "system" fn copy_texture_region(
         };
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let _host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         if dst.kind == FOOTPRINT {
             if src.kind == FOOTPRINT {
                 return;
@@ -588,7 +588,7 @@ extern "system" fn copy_texture_region(
             if lines > 1 && dst_pitch < row_bytes {
                 return;
             }
-            let Some(target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
+            let Some(_target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
                 return;
             };
             let Ok(row_bytes_u32) = u32::try_from(row_bytes) else {

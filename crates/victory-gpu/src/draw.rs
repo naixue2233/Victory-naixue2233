@@ -195,6 +195,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The pipeline this list holds now.
+    pub(crate) fn current_pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
