@@ -6989,8 +6989,7 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH`; on by default, `=0` turns
-/// it off).
+/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -7002,11 +7001,13 @@ impl HostList {
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
 ///
-/// On by default since an RTX 4070 12 GB / Ryzen 5 7500F run: "copies" went from
-/// 54-56 to 45-47 ms a frame and the frame from 144-154 to 131-139 ms.
+/// Off by default: a run that turned it on here (RTX 3080, Windows 10) drew a
+/// frame with every texture missing, as it had when #768's texture checks were
+/// put on other threads while the lists were still being recorded. The switch
+/// is kept for A/B runs (`VICTORY_WIDE_REFRESH=1`).
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
