@@ -93,6 +93,16 @@ $env:VICTORY_JOIN_COPIES = "1"
   by [naixue2233](https://github.com/naixue2233): the descriptor heap sync
   skips the pages whose bytes did not change and walks only the records a
   page's changed bytes touch. Carried here while upstream has not merged it.
+- **Further `fxceless/victory-fork` pull requests carried here:** `#22` by
+  justlovett0 (the D3D12 Agility SDK runtime a Windows 10 host needs, from
+  upstream `#175`), `#729` by grindersky (the keyboard stand-in pad stays
+  beside XInput pads), `#799` by Massive-Adrian (NVIDIA wave32 host fixes:
+  CBV clamp, loose-LDS fallback, scalar immediates), `#867` by powplusplus
+  (one frame's wait for a pipeline, indirect windows, lock-free heap mirrors),
+  `#907` (ForceEarlyDepthStencil), `#916` by SpaghettiMaster545 (only a shader
+  that can store by address declares its title-memory copies written), and
+  `#929` by AlexMiu2083 (`VICTORY_TABLE_CBV_FILL`: constants in a table are
+  read from the card's copies).
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
