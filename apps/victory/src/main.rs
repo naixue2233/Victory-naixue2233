@@ -131,6 +131,9 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Before any D3D12 device: the Agility SDK on Windows 10, the runtime
+    // Windows 11 shipped (see `agility`).
+    agility::choose();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -205,12 +208,14 @@ fn show_config() -> Result<()> {
     println!("data_dir    : {}", cfg.data_dir.display());
     match agility::runtime_dir().map(|d| d.join("D3D12Core.dll")) {
         Some(dll) if dll.exists() => println!(
-            "d3d12 sdk   : {} (version {})",
+            "d3d12 sdk   : {} (version {}) for {}",
             dll.display(),
-            agility::D3D12SDKVersion
+            agility::sdk_version(),
+            agility::choose().name()
         ),
         _ => println!(
-            "d3d12 sdk   : not beside the executable (needed on Windows 10: `cargo xtask agility`)"
+            "d3d12 sdk   : not beside the executable (needed on Windows 10: `cargo xtask agility`), {}",
+            agility::choose().name()
         ),
     }
     for t in &cfg.test_titles {

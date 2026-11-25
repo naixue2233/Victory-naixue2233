@@ -722,6 +722,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tracing",
  "victory-core",
  "victory-game",
  "victory-hle",

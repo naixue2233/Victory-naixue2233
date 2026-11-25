@@ -461,6 +461,15 @@ D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
 `target\<profile>\D3D12\`, where `victory.exe` makes D3D12 load it. Windows 11
 needs nothing.
 
+Which runtime is used is decided at startup, not at build time: the executable
+exports the Agility SDK version and path D3D12 looks for, and `victory` moves
+them before the first D3D12 call: D3D12 loads its exports when `d3d12.dll`
+loads, so `d3d12.dll` is delay-loaded and the choice is made first. On
+Windows 10 and older the runtime beside the executable is used; on Windows 11
+the version is set to 0 and the system's own runtime is used, whether or not
+the folder is there. `victory config` prints which one, and
+`VICTORY_D3D12_SDK=inbox` or `=agility` forces one for an A/B run.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager 閳?Performance 閳?Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
