@@ -574,28 +574,27 @@ impl Host {
         // The bytes shaders write go back after the submission; each range
         // once per submission, however many dispatches declared it (the
         // world's passes declare the same big ranges dozens of times). Their
-        // snapshot is taken here, once for the whole submission, and not as
-        // each declaration comes (see `Shadow::take_before`).
-        type Ranges = Vec<(usize, usize)>;
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
+        // snapshots are noted as each declaration comes and taken here, once
+        // for the whole submission, when its refreshes are done (see
+        // `Shadow::writing` and `shadow::take_snapshots`).
+        type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+        let mut back: Vec<Declared> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
-                    let range = (*address, *len);
+                    let range = (*address, *address + *len);
                     match back
                         .iter_mut()
                         .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
                     {
-                        Some((_, ranges)) if !ranges.contains(&range) => ranges.push(range),
+                        Some((_, declared)) if !declared.contains(&range) => declared.push(range),
                         Some(_) => {}
                         None => back.push((shadow.clone(), vec![range])),
                     }
                 }
             }
         }
-        for (shadow, _) in &back {
-            shadow.take_before();
-        }
+        crate::shadow::take_snapshots();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -665,9 +664,37 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        for (shadow, ranges) in &back {
-            let written = shadow.copy_back(ranges);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if crate::shadow::wide_back() {
+            // Every range first as merged spans of the copy (the pieces that
+            // differ, found on several threads), then the merges, in order.
+            let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            for (shadow, declared) in &back {
+                let mut declared = declared.clone();
+                declared.sort_unstable();
+                let start = shadow.span().0 as usize;
+                for (from, to) in crate::shadow::merge(
+                    declared.iter().map(|&(from, to)| shadow.inside(from, to - from)),
+                ) {
+                    work.push((shadow.clone(), start + from, start + to));
+                }
+            }
+            let found = crate::shadow::find_all(&work);
+            for ((shadow, from, to), found) in work.iter().zip(found) {
+                let written = shadow.copy_back_with(*from, to - *from, Some(found));
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+            for (shadow, declared) in &back {
+                shadow.copy_back_done(declared);
+            }
+        } else {
+            // One range at a time, on this thread.
+            for (shadow, declared) in &back {
+                for &(from, to) in declared {
+                    let written = shadow.copy_back(from, to - from);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                }
+                shadow.copy_back_done(declared);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1423,6 +1450,14 @@ impl Batch {
     }
 
     fn run(&mut self, refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+        // One kernel asking for the group's ranges together: the world asks
+        // once per range otherwise (2,123 askings a frame, 551 ms, in run
+        // 31). Ranges left alone, or not write-watched, are asked by
+        // `update` as before.
+        if refreshes.len() > 1 {
+            let ranges: Vec<(usize, usize)> = refreshes.iter().map(|&(_, from, to)| (from, to)).collect();
+            crate::watch::ask_ahead(&ranges);
+        }
         for (shadow, from, to) in refreshes {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -1433,6 +1468,7 @@ impl Batch {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             self.refreshed.push((shadow, from, to));
         }
+        crate::watch::ask_ahead_done();
     }
 }
 

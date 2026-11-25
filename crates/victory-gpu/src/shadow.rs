@@ -40,9 +40,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The copy's bytes before the submission ran, at the copy's own
+    /// offsets, for the ranges its shaders write: what the GPU wrote
+    /// differs. As long as the copy: the parts a range holds are taken when
+    /// it is declared and stay until every range is done with.
+    before: Mutex<Option<Vec<u8>>>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -75,6 +77,327 @@ fn give_back(v: Vec<u8>) {
     }
 }
 
+/// The unit shader writes are looked for in: 64 KiB of title memory, cut the
+/// same way the copy-back cuts it.
+const PIECE: usize = 64 << 10;
+
+/// Copies `len` bytes, on several threads if they are many: a snapshot of
+/// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
+/// one thread copies some 8 GB/s.
+///
+/// # Safety
+/// Both ranges are valid for `len` bytes and do not overlap.
+unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
+    const PER_THREAD: usize = 16 << 20;
+    let threads = (len / PER_THREAD).clamp(1, 6);
+    if threads == 1 {
+        // SAFETY: the caller's.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
+    let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
+    std::thread::scope(|s| {
+        for i in 0..threads {
+            let at = (i * each).min(len);
+            let n = each.min(len - at);
+            s.spawn(move || {
+                // SAFETY: a part of the caller's ranges.
+                unsafe {
+                    std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n);
+                }
+            });
+        }
+    });
+}
+
+/// The first byte where `a` and `b` differ (they differ).
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+/// The last byte where `a` and `b` differ (they differ).
+fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b).rposition(|(x, y)| x != y)
+}
+
+/// Whether a submission's snapshots and the compares that find what its
+/// shaders wrote are cut into pieces and run on several threads
+/// (`VICTORY_WIDE_BACK=1`; off by default).
+///
+/// The world declares thousands of ranges a submission and they were taken
+/// and compared one after another on the submitting thread, bound by one
+/// core's memory speed (run 31: 1,515 MB of snapshots in 174 ms, copy-back
+/// 128-181 ms).
+///
+/// With the switch a submission's snapshots are noted as it is prepared and
+/// taken together when its refreshes are done, just before it goes to the
+/// card ([`take_snapshots`]), and the compares of everything declared run
+/// together after the card ([`find_all`]), both cut into pieces of work of
+/// about 1 MiB for a few threads that are kept ([`wide`]).
+pub(crate) fn wide_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+}
+
+/// A piece of work for [`wide`].
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Threads kept for [`wide`]: what they are to do, and the word that there
+/// is something.
+struct Workers {
+    jobs: Mutex<std::collections::VecDeque<Job>>,
+    more: std::sync::Condvar,
+}
+
+fn workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let n = std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 4)
+            .clamp(2, 6);
+        for i in 0..n {
+            let _ = std::thread::Builder::new()
+                .name(format!("victory-wide-{i}"))
+                .spawn(move || {
+                    let workers = WORKERS.get().expect("made above");
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+/// Runs `jobs` on the kept threads and on this one, and returns when all of
+/// them are done. The jobs copy and compare memory; they do not panic.
+fn wide(jobs: Vec<Job>) {
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    let workers = workers();
+    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs {
+            let left = left.clone();
+            queue.push_back(Box::new(move || {
+                job();
+                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n -= 1;
+                if *n == 0 {
+                    left.1.notify_all();
+                }
+            }));
+        }
+    }
+    workers.more.notify_all();
+    loop {
+        let job = workers
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        match job {
+            Some(job) => job(),
+            None => break,
+        }
+    }
+    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// About this many bytes to a piece of work for [`wide`].
+const WIDE_JOB: usize = 1 << 20;
+
+/// With [`wide_back`]: the snapshots noted while a submission is prepared
+/// (where the copy's bytes are, where the snapshot's are, how many), taken by
+/// [`take_snapshots`].
+static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`] bytes
+/// each: long ones cut, short ones together.
+fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut group: Vec<(usize, usize, usize)> = Vec::new();
+    let mut bytes = 0;
+    let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
+        let group = std::mem::take(group);
+        if !group.is_empty() {
+            jobs.push(Box::new(move || {
+                for (src, dst, len) in group {
+                    // SAFETY: the caller's ranges: a host copy's mapping and
+                    // its snapshot, which do not overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                    }
+                }
+            }));
+        }
+    };
+    for (src, dst, len) in copies {
+        let mut at = 0;
+        while at < len {
+            let n = (WIDE_JOB - bytes).min(len - at);
+            group.push((src + at, dst + at, n));
+            at += n;
+            bytes += n;
+            if bytes >= WIDE_JOB {
+                flush(&mut group, &mut jobs);
+                bytes = 0;
+            }
+        }
+    }
+    flush(&mut group, &mut jobs);
+    jobs
+}
+
+/// For each of `scans` (where a copy's bytes are, where its snapshot's are,
+/// the title address the copy starts at, offsets from and to): the 64 KiB
+/// pieces of `[from, to)` whose bytes differ, as (offset, bytes) in order,
+/// found on several threads in pieces of work of about [`WIDE_JOB`] bytes
+/// that hold whole pieces.
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+    // What a job finds: (which scan, its place among that scan's jobs, the
+    // pieces).
+    type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
+    // A job's part of a scan: the scan, then which and place.
+    type Part = (usize, usize, usize, usize, usize, usize, usize);
+    let found: Arc<Mutex<Found>> = Arc::default();
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut group: Vec<Part> = Vec::new();
+    let mut bytes = 0;
+    let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
+        let group = std::mem::take(group);
+        if group.is_empty() {
+            return;
+        }
+        let found = found.clone();
+        jobs.push(Box::new(move || {
+            let mut mine: Found = Vec::with_capacity(group.len());
+            for (data, before, start, from, to, which, place) in group {
+                let mut pieces = Vec::new();
+                let mut at = from;
+                while at < to {
+                    let n = (PIECE - (start + at) % PIECE).min(to - at);
+                    // SAFETY: inside the copy's mapping and its snapshot
+                    // (which holds the copy's bytes at the copy's offsets);
+                    // nothing writes either while a submission's results
+                    // are compared.
+                    let (now, old) = unsafe {
+                        (
+                            std::slice::from_raw_parts((data + at) as *const u8, n),
+                            std::slice::from_raw_parts((before + at) as *const u8, n),
+                        )
+                    };
+                    if now != old {
+                        pieces.push((at, n));
+                    }
+                    at += n;
+                }
+                mine.push((which, place, pieces));
+            }
+            found
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(mine);
+        }));
+    };
+    let count = scans.len();
+    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+        let (mut at, mut place) = (from, 0);
+        while at < to {
+            // Cut where pieces end, so that every job sees whole pieces.
+            let room = (WIDE_JOB - bytes).max(PIECE);
+            let mut next = (at + room).min(to);
+            if next < to {
+                next -= (start + next) % PIECE;
+                if next <= at {
+                    next = (at + PIECE - (start + at) % PIECE).min(to);
+                }
+            }
+            group.push((data, before, start, at, next, which, place));
+            bytes += next - at;
+            place += 1;
+            at = next;
+            if bytes >= WIDE_JOB {
+                flush(&mut group, &mut jobs);
+                bytes = 0;
+            }
+        }
+    }
+    flush(&mut group, &mut jobs);
+    wide(jobs);
+    let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+    found.sort_unstable_by_key(|f| (f.0, f.1));
+    let mut out = vec![Vec::new(); count];
+    for (which, _, pieces) in found {
+        out[which].extend(pieces);
+    }
+    out
+}
+
+/// For each entry of `work` (a copy and the ranges its shaders may have
+/// written, declared and not yet done): the 64 KiB pieces that differ from
+/// the snapshot, as [`Shadow::copy_back`] takes them, found on several
+/// threads.
+/// With [`wide_back`]: for each of `work` (a copy and a range
+/// `[address, end)` its shaders may have written, declared and not yet
+/// done), the 64 KiB pieces that differ from the snapshot, as
+/// [`Shadow::copy_back_with`] takes them; found on several threads.
+pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    let scans = work
+        .iter()
+        .map(|(shadow, address, end)| {
+            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            // The snapshot's memory stays until the range is done with
+            // (`copy_back_done`), which comes after this.
+            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                Some(before) => (
+                    shadow.data as usize,
+                    before.as_ptr() as usize,
+                    shadow.start as usize,
+                    from,
+                    to,
+                ),
+                None => (0, 0, 0, 0, 0),
+            }
+        })
+        .collect();
+    find_pieces(scans)
+}
+
+/// With [`wide_back`], when a submission's refreshes are done and before
+/// its lists go to the card: takes the snapshots [`Shadow::writing`] noted,
+/// on several threads. Nothing to do without the switch (each range took its
+/// own bytes as it was declared).
+pub(crate) fn take_snapshots() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if snaps.is_empty() {
+        return;
+    }
+    wide(copy_jobs(snaps));
+}
+
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -92,6 +415,11 @@ impl Shadow {
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
+    }
+
+    /// Where the title buffer this copies starts and how long it is.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
     }
 
     /// Offset of a title address from the buffer's start.
@@ -122,7 +450,7 @@ impl Shadow {
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
-    fn inside(&self, address: usize, len: usize) -> (usize, usize) {
+    pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
         (from - start, (address + len).clamp(from, end) - start)
@@ -144,71 +472,70 @@ impl Shadow {
 
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// one snapshot per copy and submission, each byte taken once, when the
+    /// first range holding it is declared (the world declares overlapping
+    /// views of its 174 MB heap dozens of times, from different offsets: a
+    /// snapshot grown to cover each was copied whole every time), in reused
+    /// memory (fresh snapshots cost ~2.3 million page faults per world
+    /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-    }
-
-    /// Before the submission runs: the bytes of every range its shaders
-    /// declared ([`Shadow::writing`]) as they are now, in one copy of their
-    /// union. Taken here and not per declaration because growing the
-    /// snapshot a range at a time re-copied all of it: the world declares
-    /// dozens of scattered views of its 174 MB heap per submission, and
-    /// that growth was seconds of every world frame.
-    pub(crate) fn take_before(&self) {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let span: Option<(usize, usize)> = pending.iter().fold(None, |span, &(address, end)| {
-            let (from, to) = self.inside(address, end - address);
-            Some(match span {
-                Some((a, b)) => (a.min(from), b.max(to)),
-                None => (from, to),
-            })
-        });
-        let Some((from, to)) = span else {
-            return;
-        };
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
+        let range = (address, address + len);
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // Dispatches declare the same ranges thousands of times.
+        if pending.contains(&range) {
             return;
         }
-        let started = std::time::Instant::now();
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        // The parts no declared range holds yet: their bytes are taken now,
+        // just after the range's refresh (a part declared earlier has not
+        // been refreshed since, and keeps the bytes taken then).
+        let mut parts = vec![self.inside(address, len)];
+        for &(a, e) in pending.iter() {
+            let (a, e) = self.inside(a, e - a);
+            let mut rest = Vec::with_capacity(parts.len() + 1);
+            for (from, to) in parts {
+                if e <= from || a >= to {
+                    rest.push((from, to));
+                    continue;
+                }
+                if from < a {
+                    rest.push((from, a));
+                }
+                if e < to {
+                    rest.push((e, to));
+                }
             }
-            None => grown.extend_from_slice(host(start, end)),
+            parts = rest;
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Snapshot, grown.len() as u64);
-            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+        pending.push(range);
+        let total = self.len as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = before.get_or_insert_with(|| pooled(total));
+        debug_assert!(snapshot.capacity() >= total);
+        if wide_back() {
+            // Noted, and taken with the submission's other snapshots when
+            // its refreshes are done ([`take_snapshots`]): the range is
+            // declared from here on, so nothing changes its bytes before
+            // then. The snapshot's memory stays where it is until the range
+            // is done with ([`Shadow::copy_back_done`]).
+            let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            snaps.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (data + from, snapshot + from, to - from)),
+            );
+            return;
         }
-        let _ = started;
-        *before = Some((start, grown));
+        for (from, to) in parts {
+            if from < to {
+                // SAFETY: the copy's mapping and the snapshot's allocation
+                // (`pooled`) both hold `total` bytes, and `to <= total`.
+                unsafe {
+                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                }
+            }
+        }
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -217,90 +544,165 @@ impl Shadow {
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    ///
-    /// `ranges` are `(address, len)` as declared; overlapping ones (the
-    /// world declares many views of one big heap) are merged first, so each
-    /// byte is compared once per submission.
-    pub(crate) fn copy_back(&self, ranges: &[(usize, usize)]) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let mut written = 0;
-        let spans = merge(ranges.iter().map(|&(a, l)| self.inside(a, l)));
-        if let Some((taken, before)) = &*snapshot {
-            for &(from, to) in &spans {
-                if *taken <= from && to <= taken + before.len() {
-                    written += self.copy_span(from, to, &before[from - taken..to - taken]);
-                }
-            }
-        }
-        // Every submitted step that declared the ranges is done with them
-        // (one submission runs at a time), and the snapshot with the last.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a + l)));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
-        }
-        written
+    /// written. The range must lie in ranges declared with
+    /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
+    /// union of a submission's ranges, each byte once, then calls
+    /// [`Shadow::copy_back_done`].
+    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        self.copy_back_with(address, len, None)
     }
 
-    /// Copies back `[from, to)` (offsets in the copy), `before` being its
-    /// bytes before the submission. Returns the bytes written.
-    fn copy_span(&self, from: usize, to: usize, before: &[u8]) -> usize {
+    /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
+    /// that differ from the snapshot, found beforehand ([`find_all`]).
+    pub(crate) fn copy_back_with(
+        &self,
+        address: usize,
+        len: usize,
+        found: Option<Vec<(usize, usize)>>,
+    ) -> usize {
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
+        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
+        if let Some(before) = &*snapshot
+            && from < to
         {
+            // SAFETY: `writing` set the snapshot's bytes of every declared
+            // range, at the copy's offsets.
+            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
+            // submission, on several threads when the range is big.
+            let differing = match found {
+                Some(found) => found,
+                None => self.differing(from, to, before),
+            };
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+            for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
+                // From the first byte that differs to the last: title
+                // memory is read and written there only (a shader that sets
+                // a few words of a piece cost a read, a walk and a write of
+                // all 64 KiB of it).
+                let Some(first) = first_difference(host, old) else {
+                    continue;
+                };
+                let last = last_difference(host, old).unwrap_or(first);
+                let (at, n) = (at + first, last + 1 - first);
+                let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
+                if !crate::host::read_into((start + at) as *const u8, title) {
+                    continue;
+                }
+                // Title memory with the GPU's bytes put in; the copy takes
+                // the title's bytes in turn. Without a branch, so the loop
+                // runs many bytes at a time.
+                let mut differs = 0u8;
+                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    let gpu = if *h != *o { 0xffu8 } else { 0 };
+                    let merged = (*t & !gpu) | (*h & gpu);
+                    differs |= merged ^ *t;
+                    *t = merged;
+                    *h = merged;
+                }
+                if differs != 0 {
+                    crate::watch::writing(start + at, n);
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    written += n;
                     synced.push((start + at) / PAGE);
+                }
+            }
+            self.note_synced(from, to, synced);
+        }
+        written
+    }
+
+    /// The 64 KiB pieces of `[from, to)` (offsets in the copy) that differ
+    /// from `before` (the snapshot's bytes from `from`), as (offset, length).
+    fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
+        let (start, data) = (self.start as usize, self.data as usize);
+        let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
+            let mut found = Vec::new();
+            let mut at = a;
+            while at < b {
+                let n = (PIECE - (start + at) % PIECE).min(b - at);
+                // SAFETY: inside the mapping, which nothing writes while a
+                // submission's results are compared.
+                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+                if host != &before[at - from..at - from + n] {
+                    found.push((at, n));
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
+            found
+        };
+        const PER_THREAD: usize = 16 << 20;
+        let threads = ((to - from) / PER_THREAD).clamp(1, 8);
+        if threads == 1 {
+            return scan(from, to);
+        }
+        // Cut on piece boundaries, so that every thread sees whole pieces.
+        let cut = |i: usize| {
+            if i == threads {
+                return to;
+            }
+            let at = from + (to - from) / threads * i;
+            (at - (start + at) % PIECE).max(from)
+        };
+        let mut parts: Vec<Vec<(usize, usize)>> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|i| {
+                    let scan = &scan;
+                    let (a, b) = (cut(i), cut(i + 1));
+                    s.spawn(move || if a < b { scan(a, b) } else { Vec::new() })
+                })
+                .collect();
+            for handle in handles {
+                parts.push(handle.join().unwrap_or_default());
+            }
+        });
+        let mut found = Vec::new();
+        for part in parts {
+            found.extend(part);
+        }
+        found
+    }
+
+    /// After every range of the submission is back: the copy is done with
+    /// them, and with its snapshot once no range holds it.
+    pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|r| !ranges.contains(r));
+        if !pending.is_empty() {
+            return;
+        }
+        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            give_back(bytes);
+        }
+    }
+
+    /// The pages of `[from, to)` whose bytes were made equal to title
+    /// memory are current in the copy, so our own write is not taken for
+    /// the title's; others keep what they had (a title write there shows at
+    /// the next refresh).
+    fn note_synced(&self, from: usize, to: usize, synced: Vec<usize>) {
+        let start = self.start as usize;
+        let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+        if first < last
+            && !synced.is_empty()
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+        {
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                copied[page - base] = now;
             }
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -423,7 +825,7 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// `[from, to)` spans sorted and merged where they overlap or touch; empty
 /// ones dropped.
-fn merge(spans: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn merge(spans: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
     let mut spans: Vec<_> = spans.filter(|(f, t)| f < t).collect();
     spans.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());

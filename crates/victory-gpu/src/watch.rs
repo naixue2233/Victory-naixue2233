@@ -35,13 +35,140 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// The page spans the kernel was already asked about
+    /// ([`ask_ahead`]): `writes` answers from the journal inside them.
+    ahead: Vec<(usize, usize)>,
+    /// The number of the asking that made them.
+    ahead_asked: u64,
+    /// Whether that asking stands across the submission's refreshes
+    /// ([`ask_once`]).
+    kept: bool,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    ahead: Vec::new(),
+    ahead_asked: 0,
+    kept: false,
 });
+
+/// Page ranges of one refresh group closer than this are asked about
+/// together: walking the pages between them costs less than another kernel
+/// call (a call that resets written pages costs 30-70 microseconds whatever
+/// the range).
+const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
+const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Asks the kernel about many ranges `(start, end)` at once, before the
+/// [`writes`] of each: ranges close together are one asking, and `writes`
+/// then answers from the journal until [`ask_ahead_done`]. A world
+/// submission refreshes thousands of ranges and asked the kernel once per
+/// range (2,123 askings, 551 ms, in run 31). Ranges that are not
+/// write-watched, or lie alone, are left to `writes`.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // A submission's one asking stands ([`ask_once`]): what it does not hold
+    // is left to `writes`.
+    if j.kept {
+        return;
+    }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        ask_run(j, &pieces[i..k]);
+        i = k;
+    }
+}
+
+/// The group's refreshes are done: `writes` asks the kernel again.
+pub(crate) fn ask_ahead_done() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        j.ahead.clear();
+    }
+}
+
+/// One kernel asking for `pieces` (page ranges in order); by halves if it
+/// fails, as a run across two reservations or into memory that is not
+/// write-watched does. A piece alone is left to [`writes`].
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_kernel(j, first, last) {
+        j.ahead.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run(j, a);
+    ask_run(j, b);
+}
+
+/// Asks the kernel for the written pages of pages `[first, last)` and notes
+/// them in the journal under the ahead asking; false (and nothing changed)
+/// if the range is not write-watched memory of one reservation.
+fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    let now = j.ahead_asked;
+    for k in 0..count {
+        let page = j.found[k] / PAGE;
+        j.written.insert(page, now);
+    }
+    true
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -54,6 +181,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Asked ahead with the group's other ranges: the journal has it.
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some((
+            j.ahead_asked,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
