@@ -827,6 +827,12 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// Constants the card copies for the list from host copies in its
+    /// memory, ahead of the list ([`HostList::card_fill`]).
+    card_fill: Mutex<CardFill>,
+    /// The list that runs those copies, recorded at the list's first
+    /// submission after a reset.
+    card_fill_list: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -863,6 +869,26 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// The bytes of a chunk of the card's memory for [`HostList::card_fill`].
+const CARD_FILL_CHUNK: u64 = 1 << 20;
+
+/// What a list's constants copied on the card take ([`HostList::card_fill`]):
+/// chunks in the card's memory, kept across resets, how much of them is
+/// taken, and the copies (host copy, its offset, chunk, offset in it,
+/// bytes).
+#[derive(Default)]
+struct CardFill {
+    chunks: Vec<(ID3D12Resource, u64)>,
+    current: usize,
+    used: u64,
+    copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, usize, u64, u64)>,
+    /// Whether the copies' list is recorded for this run of the list.
+    recorded: bool,
+}
+
+// SAFETY: D3D12 resources may be used from any thread.
+unsafe impl Send for CardFill {}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3961,6 +3987,8 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                card_fill: Mutex::default(),
+                card_fill_list: OnceLock::new(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
@@ -5652,6 +5680,23 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // Constants the card copies for the lists (`HostList::card_fill`):
+        // after what went up to the card's copies just now, before the
+        // lists, in a submission of their own so that the buffers' states
+        // decay between them as everywhere else.
+        {
+            let mut seen = std::collections::HashSet::new();
+            let fills: Vec<Option<ID3D12CommandList>> = runs
+                .iter()
+                .filter(|l| seen.insert(std::ptr::from_ref::<HostList>(l) as usize))
+                .filter_map(|l| l.card_fill_commands())
+                .map(Some)
+                .collect();
+            if !fills.is_empty() {
+                // SAFETY: closed lists.
+                unsafe { self.queue.ExecuteCommandLists(&fills) };
+            }
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6187,6 +6232,13 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            // The card's copies of constants have run too: their chunks
+            // are free again (kept for the list).
+            let mut fill = self.card_fill.lock().unwrap_or_else(|e| e.into_inner());
+            (fill.current, fill.used, fill.recorded) = (0, 0, false);
+            fill.copies.clear();
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -6715,6 +6767,82 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// Constants `[address, address + len)` of `shadow`, a host copy in the
+    /// card's memory, copied by the card into memory of the list's on 256
+    /// bytes just before the list runs: the GPU address of that copy. For a
+    /// constant buffer whose title address is not on 256 bytes, which the
+    /// host cannot bind in place: copied into upload memory instead, the
+    /// CPU reads title memory at submission, and where an earlier flight's
+    /// shaders may write that waits for them to land (the world's 174 MB
+    /// heap holds its per-frame constants beside what its dispatches write:
+    /// about 190 ms a world frame, the submission lock held). The card
+    /// reads its copy after the flights before it, in queue order.
+    /// Call with the range's [`crate::shadow::Shadow::refresh`].
+    pub(crate) fn card_fill(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) -> Option<u64> {
+        let host = host()?;
+        let room = len.max(1).next_multiple_of(256);
+        if room > CARD_FILL_CHUNK {
+            return None;
+        }
+        // SAFETY: a live buffer.
+        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+        let from = shadow.gpu(address).checked_sub(base)?;
+        let mut fill = self.card_fill.lock().unwrap_or_else(|e| e.into_inner());
+        // Recorded already: the list was submitted and not reset since,
+        // and a list that runs is not recorded into.
+        if fill.recorded {
+            return None;
+        }
+        while fill.current < fill.chunks.len() && fill.used + room > CARD_FILL_CHUNK {
+            (fill.current, fill.used) = (fill.current + 1, 0);
+        }
+        if fill.current == fill.chunks.len() {
+            let chunk = host.uav_buffer(CARD_FILL_CHUNK)?;
+            name(&chunk, || "list constants on the card".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { chunk.GetGPUVirtualAddress() };
+            fill.chunks.push((chunk, gpu));
+            fill.used = 0;
+        }
+        let (chunk, at) = (fill.current, fill.used);
+        fill.used += room;
+        fill.copies.push((shadow.clone(), from, chunk, at, len));
+        Some(fill.chunks[chunk].1 + at)
+    }
+
+    /// At submission: the closed list that makes the list's
+    /// [`HostList::card_fill`] copies, if it has any. Recorded at the first
+    /// submission after a reset and run again as it is at later ones (the
+    /// same copies, of what the card's copies hold then).
+    fn card_fill_commands(&self) -> Option<ID3D12CommandList> {
+        let mut fill = self.card_fill.lock().unwrap_or_else(|e| e.into_inner());
+        if fill.copies.is_empty() {
+            return None;
+        }
+        let Some((allocator, list)) = self.card_fill_list.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref() else {
+            fail(format_args!("no host list for constants copied on the card"));
+        };
+        if !fill.recorded {
+            // SAFETY: the list last ran before this list's reset (it runs
+            // only with this list); live buffers, the ranges lie in them.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    for (shadow, from, chunk, at, len) in &fill.copies {
+                        list.CopyBufferRegion(&fill.chunks[*chunk].0, *at, &shadow.buffer, *from, *len);
+                    }
+                    list.Close()
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("constants copied on the card could not be recorded ({e})"));
+            }
+            fill.recorded = true;
+        }
+        list.cast().ok()
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
