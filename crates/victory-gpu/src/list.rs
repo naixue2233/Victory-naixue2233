@@ -1761,7 +1761,7 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),

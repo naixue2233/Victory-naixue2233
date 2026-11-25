@@ -343,6 +343,8 @@ struct Lanes {
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
+    /// Queue and sequence of a blocked head after another read used the spare space.
+    staging_reservation: Option<(u64, u64)>,
     /// A start waited for staging space since the last finish.
     starved: bool,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
@@ -407,6 +409,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_seq: 0,
                     staged: 0,
                     staging: STAGING,
+                    staging_reservation: None,
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -549,6 +552,7 @@ impl Lanes {
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
+                destination_waits = DESTINATION_WAITS.swap(0, Ordering::Relaxed),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
@@ -561,31 +565,70 @@ impl Lanes {
         }
     }
 
-    /// Starts the next read of the class with the least virtual time, from
-    /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// Selects an eligible queue head by class time, lane time and submission order.
+    fn next_lane(&self, eligible: impl Fn(&Request) -> bool) -> Option<u64> {
+        self.lanes
+            .iter()
+            .filter_map(|(&id, lane)| {
+                let (seq, request) = lane.reads.front()?;
+                eligible(request).then_some((
+                    self.clock[lane.class],
+                    lane.class,
+                    lane.clock,
+                    *seq,
+                    id,
+                ))
+            })
+            .min()
+            .map(|(_, _, _, _, id)| id)
+    }
+
+    /// Starts the next read when its staging fits, or when the buffer is empty.
+    /// A blocked head permits one fitting read from another queue before it
+    /// reserves the next admission. Only queue heads participate.
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let reservation = self.staging_reservation.filter(|&(id, seq)| {
+            self.lanes
+                .get(&id)
+                .and_then(|lane| lane.reads.front())
+                .is_some_and(|&(head, _)| head == seq)
+        });
+        self.staging_reservation = reservation;
+        let id = reservation
+            .map(|(id, _)| id)
+            .or_else(|| self.next_lane(|_| true))?;
+        let &(seq, request) = self.lanes.get(&id)?.reads.front()?;
+        let available = self.staging.saturating_sub(self.staged);
+        let id = if self.staged > 0 && self.staged + staging_bytes(&request) > self.staging {
             self.starved = true;
             self.refused += 1;
-            return None;
-        }
-        lane.reads.pop_front();
+            if reservation.is_some() {
+                return None;
+            }
+            let fitting = self.next_lane(|request| {
+                let bytes = staging_bytes(request);
+                bytes != 0 && bytes <= available
+            })?;
+            self.staging_reservation = Some((id, seq));
+            fitting
+        } else {
+            self.staging_reservation = None;
+            id
+        };
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, request) = lane.reads.pop_front()?;
+        let staging = staging_bytes(&request);
+        let class = lane.class;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
+        // Charge a bypass to its queue without advancing the clocks used to
+        // admit newly active queues ahead of the reserved read.
+        if self.staging_reservation.is_none() {
+            self.now = self.clock[class];
+            self.lane_now[class] = lane.clock;
+        }
         self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
         lane.clock += size;
         Some(Job {
             lane: id,
@@ -1086,17 +1129,20 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let count = (offset + len).div_ceil(PAGE);
+    // The page numbers as the title has them now: it may still be writing
+    // them (read each time, not kept).
+    let read_pages = || -> Vec<usize> {
+        (0..count)
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, which holds at least `len` bytes from `offset`.
+            .map(|i| unsafe { std::ptr::read_volatile(request.destination.cast::<usize>().add(i)) })
+            .collect()
     };
+    let mut pages = read_pages();
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         let filled = fill(window.bytes()).map(drop);
         drop(window);
         // The title maps pages where the card reads them and has them
@@ -1104,17 +1150,48 @@ fn into_destination(
         // learn of the bytes only from this (upstream c75fdba, fork PR
         // #571). After a decode that failed part way too: what it wrote
         // is there.
-        super::xmem::pages_written(pages, offset, len);
+        super::xmem::pages_written(&pages, offset, len);
         return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    // A page number not known yet: the title may fill the array after it
+    // enqueued the request, and a queue submits on its own once half full,
+    // so a worker can come to it first. (Failed at once, 302 requests of a
+    // burst at the opening's loading went unwritten in one run, 44 and 9 in
+    // others; one was known 17 us later.) The numbers are read again for a
+    // while.
+    let waiting = std::time::Instant::now();
+    let mut waited = 0u32;
+    while !super::xmem::pages_known(&pages, offset, n) && waiting.elapsed() < std::time::Duration::from_millis(250) {
+        waited += 1;
+        if waited < 16 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pages = read_pages();
+    }
+    if waited > 0 {
+        DESTINATION_WAITS.fetch_add(1, Ordering::Relaxed);
+        if super::xmem::pages_known(&pages, offset, n) {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| {
+                tracing::info!(
+                    tries = waited,
+                    us = waiting.elapsed().as_micros() as u64,
+                    "dstorage: a destination's page numbers were known only after the request was taken (read again until they were)"
+                );
+            });
+        }
+    }
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
     // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
     // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
+    // that tried again (run 165) lost none of 13. The page numbers are read
+    // again before each try.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
@@ -1122,12 +1199,13 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
     let mut tries = 0u32;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        pages = read_pages();
+        written = super::xmem::write_physical(&pages, offset, &data[..n]);
     }
     if written {
         if tries > 0 {
@@ -1142,17 +1220,11 @@ fn into_destination(
             );
         }
         // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
+        super::xmem::pages_written(&pages, offset, n);
         Ok(())
     } else {
+        let known = super::xmem::pages_known(&pages, offset, n);
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1161,11 +1233,20 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            why = if known { "the host could not map them" } else { "a page number is unknown" },
+            tries,
+            given_up,
+            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+            "dstorage: a destination's physical pages could not be written; its request fails (VICTORY_DSTORAGE_RETRIES)"
         );
         Err(E_INVALIDARG)
     }
 }
+
+/// Requests whose destination page numbers were read again because one was
+/// not known when a worker took the request.
+static DESTINATION_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -1454,6 +1535,7 @@ mod tests {
             next_seq: 0,
             staged: 0,
             staging,
+            staging_reservation: None,
             starved: false,
             clock: [0; 3],
             now: 0,
@@ -1516,6 +1598,52 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn a_blocked_read_allows_one_fitting_read_from_another_queue() {
+        let mut l = lanes(100);
+        for id in 0..4 {
+            l.lanes.insert(id, Lane::new(0, 64));
+        }
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+        let active = l.start().unwrap();
+
+        for (id, size) in [(1, 80), (2, 20), (3, 20)] {
+            read(&mut l, id, ZLIB, size);
+            l.submit(id);
+        }
+
+        let small = l
+            .start()
+            .expect("another queue can use the free staging space");
+        assert_eq!((small.lane, l.staged), (2, 80));
+        assert!(l.start().is_none(), "keep space for the blocked read");
+        l.finish(&small, Ok(()));
+        assert!(l.start().is_none(), "the same blocked read gets only one bypass");
+
+        l.finish(&active, Ok(()));
+        let large = l.start().unwrap();
+        assert_eq!((large.lane, l.staged), (1, 80));
+        assert_eq!(l.start().unwrap().lane, 3);
+        assert_eq!(l.staged, 100);
+    }
+
+    #[test]
+    fn clearing_a_blocked_queue_releases_its_staging_reservation() {
+        let mut l = lanes(100);
+        for (id, size) in [(0, 60), (1, 80), (2, 20), (3, 10)] {
+            l.lanes.insert(id, Lane::new(0, 64));
+            read(&mut l, id, ZLIB, size);
+            l.submit(id);
+        }
+
+        assert_eq!(l.start().unwrap().lane, 0);
+        assert_eq!(l.start().unwrap().lane, 2);
+        l.lanes.get_mut(&1).unwrap().reads.clear();
+        assert_eq!(l.start().unwrap().lane, 3);
+        assert_eq!(l.staged, 90);
     }
 
     #[test]

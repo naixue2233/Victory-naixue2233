@@ -1,48 +1,120 @@
-# VIctory fork (work in progress)
+# victory-exo (NVIDIA Wave32 Integration & Performance Fork)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+An integration and performance-validated fork of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title natively on Windows from files the user supplies.
+
+`victory-exo` tracks `fxceless/victory-fork` `main` (currently **`f85101b`**)
+and curates tested community pull requests plus NVIDIA Wave32 stability fixes
+into a single verified build, targeting **high frame rates, 100% shader
+translation coverage on 32-lane NVIDIA GPUs, and zero device removals**.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+copy of the title outside the repository. It is not affiliated with or endorsed
+by the title's developer or publisher.
+
+## Status & Measured Results (`victory-exo`, 2026-11-25)
+
+Tested on **Windows 11 x64, NVIDIA GeForce RTX 3080 Ti (12 GB VRAM, SM 6.6,
+Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
+`#798`):
+
+| Metric (4,700–6,100 draws/frame, Series X) | `9376fd6` stack | **`victory-exo` (`f85101b` stack)** |
+|---|---|---|
+| **Steady world FPS** | `4.1–4.7 fps` | **`7.8–8.8 fps`** *(10+ fps peaks)* |
+| **Frame time** | `213–243 ms` | **`113.2–127.8 ms`** |
+| **GPU time** | `81–147 ms` | **`29.6–47.5 ms`** |
+| **Copy-back (`VICTORY_SKIP_WC_COMPARE=1`)** | `38–42 ms` (`50–66 MB`) | **`5.2–7.2 ms` (`2.4–2.9 MB`)** |
+| **CPU `preparing` / `copies`** | `83–96 ms` (`150–163 MB`) | **`55–66 ms` (`60–76 MB`)** |
+| **Shader warm-up (`translate --warm`)** | `3,097 / 3,101` | **`3,199 / 3,199` (`0` failed)** |
+| **Refused pipelines / Crashes / Device losses** | `7 refused, 0 crashes` | **`0 refused, 0 crashes, 0 TDRs`** |
+
+### What `victory-exo` Integrates on Top of `fxceless/victory-fork@f85101b`
+
+- **Performance & Sync:** `#868` (card copy census + opt-in `VICTORY_SKIP_WC_COMPARE=1` for indoor benchmarking), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
+- **Streaming & Stability:** `#855` (DirectStorage re-reads destination physical page numbers instead of failing requests immediately), `#886` (DirectStorage fills spare staging space across queues for faster LOD/model loading), `#892` (dedicated pipeline workers & wait budget for screen passes).
+- **Textures & Formats:** `#374` (BCPack keeps all 32 indices in BC7 dictionary entry 0 — fixes rainbow 4×4 BC7 blocks on character clothing/skin), `#632` (preserves replacement texture views after stale mapping checks), `#559` (texture recheck fingerprint reads every mip of every slice).
+- **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs — **3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
+- **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes — fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
+- **Local integration fixes (`victory-exo`):**
+  - Clamp `D3D12_CONSTANT_BUFFER_VIEW_DESC.SizeInBytes` to D3D12's 64 KiB (`65536`) limit (`88f2b82`) to prevent NVIDIA `0x887A0001` device losses on oversized CBVs.
+  - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`), and `#860` `fill_ahead` with `#559` (`c2ca45f`).
+  - Verified test suite: `cargo xtask policy` (**183 files ok**), `victory-formats` (**29/29**), `victory-gpu` (**177/177**), `victory-hle` (**120/120**).
+
+### Progression & Known Remaining Issues
+- **Verified playable progression:** Boot, menus, opening cutscene, prison interior & corridor, opening interview cutscene, and **Chapter 1 transition / boat scene** (with `0` refused/untranslated shaders and `0` crashes).
+- **Chapter 1 boat buoyancy bug (upstream `#863` / `VIctory#2248`):** The boat sinks to hull depth when physics takes over after the cutscene because `ShallowWaterSim:CS_ResolveHeightLookUps` results are not reaching CPU physics (`CpuReadBackShaderResourceBuffer`). Tracked upstream in `#863` (keep `VICTORY_SKIP_WC_COMPARE=1` **off** for normal gameplay).
+- **Blocky shadow halos & blotchy interior shadows:** The title's lamp/sun shadows and indirect GI are ray-traced via custom compute shaders (`docs/fork-ray-tracing.md`) and are off by default; until live ray tracing lands, screen-space denoisers operate on coarse tile masks along depth edges.
+- **Glitchy foliage/trees & occasional partial character skin textures** during rapid cutscene transitions (next candidates to test: `#858` PSV0 mesh interpolation, `#676`, `#704`, `#740`).
+
+### Recommended Launch Profile (NVIDIA 12 GB+ VRAM, Windows 11)
+
+```powershell
+# Optional one-time shader cache warm-up (after building):
+# $env:VICTORY_HOST_WAVE="32"; $env:VICTORY_VIEW_LIMIT="999999"
+# .\target\release\victory.exe translate --warm <title_exe>
+
+$env:VICTORY_ASYNC_SUBMIT = "1"
+$env:VICTORY_QUEUE2 = "1"
+# Opt-in indoor benchmark only (keep OFF for water/boat physics in Chapter 1):
+# $env:VICTORY_SKIP_WC_COMPARE = "1"
+$env:VICTORY_LEVELS_ON_DEMAND = "1"
+$env:VICTORY_EARLY_TEXTURES_MS = "60"
+$env:VICTORY_CARD_FETCH_INFLIGHT = "1"
+$env:VICTORY_WIDE_TEXTURES = "1"
+$env:VICTORY_INDIRECT_WINDOW = "1"
+$env:VICTORY_CARD_REHASH_RUNS = "1"
+$env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "1024"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+$env:VICTORY_PIPELINE_WAIT_MS = "24"
+$env:VICTORY_JOIN_COPIES = "1"
+
+.\target\release\victory.exe run "<path-to-title-exe>" --execute
+# Add `--console series-s` for Series S profile (supported via #798).
+```
+
+*(Upstream validation PR tracking this stack: [fxceless/victory-fork#770](https://github.com/fxceless/victory-fork/pull/770).)*
+
+---
 
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  GPL-3.0-or-later; so is this fork.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** by
+  fxceless and all PR authors (`#510`, `#577`, `#644`, `#715`, `#764`, `#765`,
+  `#768`, `#795`, `#798`, `#812`, `#845`, `#854`, `#857`, `#860`, `#864`,
+  `#868`) plus cross-testing notes from `@ArturoWolff` and `@HLVM04`.
+- **[fxceless/victory-fork#783](https://github.com/fxceless/victory-fork/pull/783)**
+  by [naixue2233](https://github.com/naixue2233): the descriptor heap sync
+  skips the pages whose bytes did not change and walks only the records a
+  page's changed bytes touch. Carried here while upstream has not merged it.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - The guard over every view of a memory page is code by **myokex**
   ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
-  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
+  adapts pull request #115 by Spexivus, its correction by joroyt and a part of
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
-  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
-  are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family).
 
-## Status of this fork (2026-11-25)
+---
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+## Upstream `fxceless/victory-fork` History & Notes (2026-11-25)
 
-| Stage | State in this fork |
+| Stage | Upstream baseline state |
 |-------|--------------------|
 | Boot, menus, start screen | works, 30 fps (as upstream) |
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+| Frame rate in the world | 2-4 fps baseline, 6-7 fps on `f85101b` (RTX 4070), 7.8-10+ fps on `victory-exo` (RTX 3080 Ti) |
+| Stability | no driver hang or device loss in normal runs |
 
 ### Newest (2026-11-25, later the same day)
 
@@ -212,6 +284,11 @@ Memory sync between the title's memory and the copies on the card:
   them in every run) and can open the guards there:
   `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
+- A page-destination read whose page numbers the title writes after it
+  enqueued the request reads them again for up to 250 ms instead of failing
+  at once: up to 302 requests of a burst at the opening's loading failed so
+  (their models or textures kept whatever their pages held); none since
+  (RTX 5090).
 
 Card memory (the test card is full from the first frame of the world: 85 to
 99 % of its budget for a whole run, about 26,000 texture copies let go and
@@ -318,7 +395,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard and mouse as a pad (rebindable) | Trigger rumble; keyboard prompts |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
@@ -362,17 +439,32 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads, and the keyboard as one more pad while the title's
-window has focus:
+Input: XInput pads, and keyboard and mouse played like a PC game. The title
+reads pads only, so the keyboard and mouse act on the first connected pad (or
+a stand-in pad when none is): both work at once, each stick follows whichever
+moved it last. The mouse turns the camera through the right stick, its motion
+turned into a rate at each read of the title so the same movement turns the
+same angle at any frame rate. While the window has focus the cursor is hidden
+and held in it; Alt-Tab or Esc frees it, a click or Esc captures it again.
+With `[controls] enabled = false` the stand-in pad stays connected beside host
+pads too, since some keyboards (Wooting) also present an XInput pad that never
+reports keys.
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| Keys (on foot) | Pad | Keys (in a vehicle) | Pad |
+|------|-----|------|-----|
+| W A S D, Left Alt | left stick, walk | W / S, A D | RT / LT, steer |
+| mouse, left / right button | right stick, RT / LT | Space, E | RB, LS |
+| Left Shift, Space, F, R | A, X, Y, B | F, G | Y + vehicle layout off, layout only |
+| Q, E, Left Ctrl, C | RB, D-pad right, LS, RS | | |
+| Tab, V or M, wheel | LB, View, D-pad left / right | | |
+| arrows, Enter, Backspace, Esc or P | D-pad, A, B, Menu | | |
+
+The letters are the keys at those places on a US keyboard, so the left stick
+is Z Q S D on an AZERTY keyboard (`keys_by_position = false`: by letter).
+F (enter a vehicle) also switches to the vehicle layout and back; G switches
+it alone when it is out of step. Rebind everything in `[controls]` of
+`victory.toml` (see `victory.example.toml`); `enabled = false` brings back the
+old fixed stand-in pad (W A S D / I J K L sticks, Enter, Backspace, X, Y).
 
 ## Commands
 
@@ -410,6 +502,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_EARLY_PIPELINES=0` | start a host pipeline when a draw or dispatch first requests it. Keeps the learned list, shader cache, and driver pipeline library for comparing startup scheduling across runs |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
