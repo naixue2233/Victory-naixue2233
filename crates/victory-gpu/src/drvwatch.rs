@@ -15,6 +15,12 @@
 //! turn themselves off for the rest of the run). So a driver error costs a
 //! slower frame from then on, and not the card.
 //!
+//! The system's own display source (`Display`) counts only for its
+//! warnings and errors ("display driver stopped responding and has
+//! recovered", 4101, is a warning): Windows also writes Auto HDR's notices
+//! there as information entries (4125, 4127), and those say nothing of the
+//! driver.
+//!
 //! On by default; `VICTORY_DRIVER_WATCH=0` subscribes to nothing.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -22,6 +28,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::System::EventLog::{
     EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION, EvtSubscribe, EvtSubscribeActionDeliver, EvtSubscribeToFutureEvents,
 };
+
+/// The kernel drivers of the three vendors: every entry of theirs counts.
+const DRIVERS: [&str; 5] = ["nvlddmkm", "amdkmdag", "amdwddmg", "igfx", "igfxn"];
+
+/// The subscription's query: every entry of `drivers`, and the entries of
+/// `system` from warning level up (critical 1, error 2, warning 3; its
+/// information entries, level 4, are left out).
+fn query(drivers: &[&str], system: &str) -> String {
+    let drivers = drivers.iter().map(|d| format!("@Name='{d}'")).collect::<Vec<_>>().join(" or ");
+    format!("*[System[Provider[{drivers}] or (Provider[@Name='{system}'] and (Level=1 or Level=2 or Level=3))]]")
+}
 
 /// Entries of a display driver seen since the start.
 static ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -71,12 +88,10 @@ pub(crate) fn start() {
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
-        // The kernel drivers of the three vendors, and the system's own
-        // "display driver stopped responding" source.
-        let query = wide(
-            "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
-        );
+        // The kernel drivers of the three vendors, and the warnings and
+        // errors of the system's own "display driver stopped responding"
+        // source.
+        let query = wide(&query(&DRIVERS, "Display"));
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
         // kept for the life of the process.
@@ -176,7 +191,7 @@ mod tests {
     #[test]
     fn the_system_takes_the_subscription() {
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let (channel, query) = (wide("System"), wide("*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]"));
+        let (channel, query) = (wide("System"), wide(&query(&DRIVERS, "Display")));
         // SAFETY: as in `start`.
         let subscription = unsafe {
             EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(on_event), EvtSubscribeToFutureEvents)
@@ -184,5 +199,83 @@ mod tests {
         assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
         // SAFETY: our own subscription.
         unsafe { windows_sys::Win32::System::EventLog::EvtClose(subscription) };
+    }
+
+    /// End to end, by hand (`--ignored`): [`query`] read the way [`start`]
+    /// reads it, with a name of our own in the Application log standing for
+    /// the system's display source, then for a vendor's driver. Of an
+    /// information entry and an error entry written under it, the display
+    /// source passes the error alone (an Auto HDR notice is an information
+    /// entry of `Display`, fxceless/victory-fork#1077); a driver passes both.
+    /// It leaves two entries in that log.
+    #[test]
+    #[ignore = "writes two entries to the Application event log: run it by name with --ignored"]
+    fn the_display_source_counts_from_warnings_up_and_a_driver_always() {
+        use windows_sys::Win32::System::EventLog::{
+            DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_INFORMATION_TYPE, EvtClose, RegisterEventSourceW, ReportEventW,
+        };
+        type Callback = unsafe extern "system" fn(EVT_SUBSCRIBE_NOTIFY_ACTION, *const core::ffi::c_void, EVT_HANDLE) -> u32;
+        static AS_DISPLAY: AtomicU64 = AtomicU64::new(0);
+        static AS_DRIVER: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn display(action: EVT_SUBSCRIBE_NOTIFY_ACTION, _: *const core::ffi::c_void, _: EVT_HANDLE) -> u32 {
+            if action == EvtSubscribeActionDeliver {
+                AS_DISPLAY.fetch_add(1, Relaxed);
+            }
+            0
+        }
+        unsafe extern "system" fn driver(action: EVT_SUBSCRIBE_NOTIFY_ACTION, _: *const core::ffi::c_void, _: EVT_HANDLE) -> u32 {
+            if action == EvtSubscribeActionDeliver {
+                AS_DRIVER.fetch_add(1, Relaxed);
+            }
+            0
+        }
+        const NAME: &str = "victory-drvwatch-level-test";
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let channel = wide("Application");
+        let subscribe = |query: &str, callback: Callback| {
+            let query = wide(query);
+            // SAFETY: as in `start`.
+            let subscription = unsafe {
+                EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(callback), EvtSubscribeToFutureEvents)
+            };
+            assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
+            subscription
+        };
+        let subscriptions = [
+            subscribe(&query(&["victory-drvwatch-no-driver"], NAME), display),
+            subscribe(&query(&[NAME], "victory-drvwatch-no-display"), driver),
+        ];
+        let name = wide(NAME);
+        // SAFETY: a source of our own name, one string per entry, no data.
+        unsafe {
+            let source = RegisterEventSourceW(std::ptr::null(), name.as_ptr());
+            assert!(!source.is_null(), "{}", std::io::Error::last_os_error());
+            for (kind, text) in [
+                (EVENTLOG_INFORMATION_TYPE, "an information entry of the VIctory layer's driver watch test"),
+                (EVENTLOG_ERROR_TYPE, "an error entry of the VIctory layer's driver watch test"),
+            ] {
+                let text = wide(text);
+                let strings = [text.as_ptr()];
+                assert_ne!(
+                    ReportEventW(source, kind, 0, 1, std::ptr::null_mut(), 1, 0, strings.as_ptr(), std::ptr::null()),
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            DeregisterEventSource(source);
+        }
+        let started = std::time::Instant::now();
+        while AS_DRIVER.load(Relaxed) < 2 && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // What the display source would wrongly pass arrives with them.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for subscription in subscriptions {
+            // SAFETY: our own subscription.
+            unsafe { EvtClose(subscription) };
+        }
+        assert_eq!(AS_DRIVER.load(Relaxed), 2, "a driver's entries: both, whatever their level");
+        assert_eq!(AS_DISPLAY.load(Relaxed), 1, "the display source's entries: the error alone");
     }
 }
