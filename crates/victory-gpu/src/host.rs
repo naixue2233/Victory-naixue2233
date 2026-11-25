@@ -1530,7 +1530,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    // On by default: the world went from 273-370 ms a frame to 252-285 ms with
+    // it (run 68 against run 69, card buffers on in both).
+    // `VICTORY_CARD_REHASH_RUNS=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the

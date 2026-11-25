@@ -151,7 +151,12 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        // 1 MiB and 1024 MB by default: the world went from 403 ms a frame
+        // (run 59, no card buffers) to 273-370 ms (run 68) and 252-285 ms with
+        // the rehash runs joined (run 69) on an RTX 3080. 1 MiB is where the
+        // title's skinning and BVH lists are; the log line says how many bytes
+        // of copies would have gone to the card with a smaller one.
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
 }
 
