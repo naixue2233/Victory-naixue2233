@@ -2600,7 +2600,7 @@ mod fill_ahead {
 
     /// The fingerprint of the title memory a fill reads.
     fn print(src: usize, len: usize) -> u64 {
-        crate::texture::fingerprint(src as u64, len as u64)
+        crate::texture::fingerprint(src as u64, len as u64, &[])
     }
 
     #[derive(Default)]
