@@ -560,7 +560,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
+                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command, \
+                 VICTORY_D3D12_DRED=1 names the faulting allocation and command",
             ),
             None => {}
         }
@@ -1307,13 +1308,18 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (`VICTORY_D3D12_DRED`).
+///
+/// On in any build, release and diagnostics alike: a run that loses the
+/// device on someone else's machine can be told to turn this on without
+/// them building a second binary (RTX 4090 laptop, Windows 11 build 26200,
+/// two reports of `0x887A0005` with "no breadcrumbs (0x887A0004)" — that
+/// code is what asking a device without the data enabled answers). What it
+/// costs while on: a name on every object of ours, and the commands the
+/// breadcrumbs note.
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_DRED").is_some())
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
