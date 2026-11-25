@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -26,6 +27,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Lock-free mirror of `made` updated with Release after host slot creation
+    /// and cleared before unmaking, so hot-path `mirror` hits avoid locking `made`.
+    made_keys: Vec<AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1041,6 +1045,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1569,6 +1574,9 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
+        if let Some(slot) = self.made_keys.get(index as usize) {
+            slot.store(0, Ordering::Release);
+        }
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -2098,12 +2106,20 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Fast path: slot already holds this exact made descriptor.
+        if tag == VIEW_TAG
+            && self.made_keys[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.made_keys[index as usize].store(0, Ordering::Release);
                 made[index as usize] = 0;
                 self.forget_tiled(index);
                 self.make_null(index);
@@ -2147,7 +2163,11 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
+            let new_key = if later { 0 } else { key };
+            if new_key == 0 {
+                self.made_keys[index as usize].store(0, Ordering::Release);
+            }
+            made[index as usize] = new_key;
             let built = if later {
                 None
             } else {
@@ -2162,6 +2182,9 @@ impl HostHeap {
             };
             self.record_tiled(index, &view, tiled);
             self.keep(index, kept);
+            if new_key != 0 {
+                self.made_keys[index as usize].store(new_key, Ordering::Release);
+            }
         } else if self.tiled_stale(index) {
             let built = make(&view, self.cpu(index));
             if built.is_none() && !self.sampler {

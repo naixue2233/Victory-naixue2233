@@ -374,6 +374,13 @@ fn clamp_into(
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
+        #[cfg(feature = "diagnostics")]
+        let waits = crate::copystat::barrier_test() & 2 == 0;
+        #[cfg(not(feature = "diagnostics"))]
+        let waits = true;
+        if waits {
+            list.clear_uav_dirty();
+        }
     }
     recorded
 }
@@ -999,7 +1006,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1073,7 +1080,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1131,6 +1138,46 @@ void main() {
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
+    #[test]
+    fn card_compare_hlsl_compiles() {
+        for (name, src) in [
+            ("card_compare", crate::host::CARD_COMPARE),
+            ("card_fetch", crate::host::CARD_FETCH),
+        ] {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: static strings and valid output pointers.
+            let res = unsafe {
+                D3DCompile(
+                    src.as_ptr().cast(),
+                    src.len(),
+                    s!("card"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = res {
+                let msg = errors
+                    .map(|b| unsafe {
+                        let s = std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        );
+                        String::from_utf8_lossy(s).into_owned()
+                    })
+                    .unwrap_or_default();
+                panic!("{name} HLSL failed to compile: {e}: {msg}");
+            }
+            assert!(code.is_some());
+        }
+    }
+
     #[test]
     fn argument_clamp_builds() {
         if super::host().is_none() {

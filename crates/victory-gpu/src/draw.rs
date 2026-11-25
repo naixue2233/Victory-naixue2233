@@ -137,11 +137,11 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=0` turns
+/// it off; on by default).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -185,9 +185,21 @@ const WINDOW_MOST: u64 = 64;
 /// Off for the rest of the run from the first error the card's driver
 /// reports to the system (`crate::drvwatch`): every loss of the card in a
 /// run with windows was announced that way seconds ahead.
+///
+/// Indirect window diagnostics: [hits, miss_dispatch, miss_max, miss_count,
+/// miss_stores, miss_no_window_or_diff, miss_step_or_fit].
+#[cfg(feature = "diagnostics")]
+static WINDOW_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_window_stats() -> [u64; 7] {
+    WINDOW_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+        && !crate::drvwatch::tripped()
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -602,7 +614,20 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut rtv_len = 0usize;
+        let mut rtv_heap: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+        let mut push_rtv = |h: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            if rtv_heap.is_empty() && rtv_len < rtv_stack.len() {
+                rtv_stack[rtv_len] = h;
+                rtv_len += 1;
+            } else {
+                if rtv_heap.is_empty() {
+                    rtv_heap.extend_from_slice(&rtv_stack[..rtv_len]);
+                }
+                rtv_heap.push(h);
+            }
+        };
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -622,15 +647,20 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    push_rtv(host.rtv(None, Some(&desc)));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            push_rtv(host.rtv(Some(texture), record.desc().as_ref()));
         }
+        let rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE] = if rtv_heap.is_empty() {
+            &rtv_stack[..rtv_len]
+        } else {
+            &rtv_heap
+        };
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1026,7 +1056,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack_values = [0u32; 64];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_values.len() {
+                    &mut stack_values[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1160,6 +1197,22 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        if compute || p.stages.iter().any(|s| s.translated().stores) {
+            self.window = None;
+        }
+        if compute
+            || p.stages.iter().any(|s| {
+                let t = s.translated();
+                t.stores
+                    || !s.root_uavs.is_empty()
+                    || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+                    || t.host
+                        .root_srvs
+                        .contains(&victory_shader::emit::SLOT_STRIDES)
+            })
+        {
+            list.mark_uav_dirty();
+        }
         true
     }
 
@@ -1777,14 +1830,13 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20)
         }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
+        // A backlog (a scene's first minutes) gets twice the bytes and time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 2, span * 2) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2347,7 +2399,6 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2737,7 +2788,6 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2841,7 +2891,6 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2988,6 +3037,8 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
+                #[cfg(feature = "diagnostics")]
+                WINDOW_STATS[0].fetch_add(1, Ordering::Relaxed);
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3005,21 +3056,62 @@ impl State {
                 (scratch, at)
             }
             None => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let idx = if kind == DISPATCH {
+                        1
+                    } else if max != 1 {
+                        2
+                    } else if count.is_some() {
+                        3
+                    } else if p.stages.iter().any(|stage| stage.translated().stores) {
+                        4
+                    } else if self.window.as_ref().is_none_or(|w| !same(w)) {
+                        5
+                    } else {
+                        6
+                    };
+                    WINDOW_STATS[idx].fetch_add(1, Ordering::Relaxed);
+                }
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
+                // after it are clamped with it. Only widen to `step` when at
+                // least two full steps fit in `args` so the clamp shader never
+                // reads past the end of `args.buffer`.
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
+                        let diff = offset.saturating_sub(last);
+                        // When the title walks forward through the argument
+                        // buffer (even skipping culled slots), clamp densely
+                        // at `stride` if `diff` is a multiple of `stride` so
+                        // skipped/sparse slots still hit; otherwise keep the
+                        // observed record step.
+                        let (candidate_step, walks) = if diff >= u64::from(stride)
+                            && diff <= 1024
+                            && diff % u64::from(stride) == 0
+                        {
+                            (u64::from(stride), true)
+                        } else if diff >= u64::from(stride)
+                            && diff <= 512
+                            && diff % 4 == 0
+                            && (w.records == 1 || diff % u64::from(w.step) == 0)
+                        {
+                            (if w.records == 1 { diff } else { u64::from(w.step) }, true)
+                        } else {
+                            (u64::from(stride), false)
+                        };
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            let fit = (args.left(arguments) / candidate_step).min(WINDOW_MOST) as u32;
+                            if fit >= 2 {
+                                (
+                                    candidate_step as u32,
+                                    (if w.records == 1 { 32 } else { w.records * 2 }).min(fit),
+                                )
+                            } else {
+                                (stride, max)
+                            }
                         } else {
                             (stride, max)
                         }
@@ -3042,7 +3134,6 @@ impl State {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
-                    self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };

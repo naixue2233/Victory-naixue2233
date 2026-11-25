@@ -757,12 +757,17 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let buffer_wait = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        });
+        let global_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
+        if buffer_wait {
             host.push(UAV_BARRIER);
+            list.clear_uav_dirty();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        } else if global_uav {
+            list.clear_uav_dirty();
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -826,6 +831,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        list.mark_uav_dirty();
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -910,6 +916,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            list.mark_uav_dirty();
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1615,16 +1622,27 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        if one_range != 0 && !handles.is_null() {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            if count <= 8 {
+                let mut buf = [0u64; 8];
+                for (i, slot) in buf[..count as usize].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                with_state(this, |list, s| {
+                    s.set_targets(list, &buf[..count as usize], depth)
+                });
+            } else {
+                let handles: Vec<u64> = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                with_state(this, |list, s| s.set_targets(list, &handles, depth));
+            }
+        } else {
+            let handles = items(handles, count);
+            with_state(this, |list, s| s.set_targets(list, handles, depth));
+        }
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -1991,18 +2009,21 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
-    }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
+        if !list.take_uav_dirty() {
+            return;
+        }
+        // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+            if crate::copystat::barrier_test() & 1 != 0 {
+                return;
+            }
+        }
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
