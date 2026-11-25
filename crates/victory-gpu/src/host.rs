@@ -8588,16 +8588,17 @@ extern "system" fn window_proc(
     // the log: on a test machine Windows reset the card four times in one
     // day, each 2.5 to 4.6 s after a remote-desktop host ended its session
     // and removed its virtual input device, and nothing in our log showed
-    // it.
+    // it. In the trail too, which the report of a removal prints with how
+    // long before it each came.
     match message {
-        WM_DISPLAYCHANGE => tracing::info!(
-            width = lparam.0 & 0xffff,
-            height = (lparam.0 >> 16) & 0xffff,
-            bits = wparam.0,
-            "the display's mode changed"
-        ),
+        WM_DISPLAYCHANGE => {
+            let (width, height) = (lparam.0 & 0xffff, (lparam.0 >> 16) & 0xffff);
+            tracing::info!(width, height, bits = wparam.0, "the display's mode changed");
+            trail(|| format!("the display's mode changed to {width}x{height}"));
+        }
         WM_DEVICECHANGE if wparam.0 == DBT_DEVNODES_CHANGED as usize => {
-            tracing::info!("a device was added to or removed from the system")
+            tracing::info!("a device was added to or removed from the system");
+            trail(|| "a device was added to or removed from the system".to_owned());
         }
         _ => {}
     }
