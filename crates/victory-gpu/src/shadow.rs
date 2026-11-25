@@ -470,7 +470,13 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| {
+        // On by default (stage 2): the world's frame went from 704 ms to 403 ms
+        // with it in run 57 (measured on an RTX 3080). `VICTORY_RELAY=0` turns
+        // it off, `=1` keeps the results on the submitting thread.
+        let stage = std::env::var("VICTORY_RELAY").unwrap_or_else(|_| "2".to_string());
+        (stage == "1" || stage == "2") && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -961,7 +967,9 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    // On by default: the snapshots and the compare run on the kept threads.
+    // `VICTORY_WIDE_BACK=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;

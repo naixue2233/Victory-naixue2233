@@ -61,9 +61,21 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+fn ahead_gap() -> usize {
+    let mb = std::env::var("VICTORY_AHEAD_GAP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    (mb.max(1) << 20) / PAGE
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+fn ahead_max() -> usize {
+    let mb = std::env::var("VICTORY_AHEAD_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);
+    (mb.max(1) << 20) / PAGE
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -91,15 +103,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    let gap = ahead_gap();
+    let most = ahead_max();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
+        while k < pieces.len() && pieces[k].0 <= last + gap && last.max(pieces[k].1) - first <= most {
             last = last.max(pieces[k].1);
             k += 1;
         }
