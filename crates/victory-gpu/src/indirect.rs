@@ -970,10 +970,17 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        // Both forms: a group a piece (the default), a thread a piece.
+        for (source, groups) in [(crate::host::CARD_COMPARE, 3), (crate::host::CARD_COMPARE_THREAD, 1)] {
+            card_compare_stores_the_hash_it_made_when_told(source, groups);
+        }
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, groups: u32) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -999,7 +1006,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(groups, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1027,6 +1034,171 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Both forms of the card compare on the host GPU flag the same pieces
+    /// for the same bytes, and exactly the pieces whose bytes (widened to
+    /// 16 at both ends) changed: a copy of 16 pieces that starts 40 bytes
+    /// into its first piece, hashed (told 0), then 48 rounds of a few
+    /// random byte changes, some at the pieces' edges, each compared and
+    /// stored (told 2) by both forms.
+    #[test]
+    fn card_compare_forms_flag_alike_on_the_card() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let wide = compile_cs(&host.device, crate::host::CARD_COMPARE).expect("the card compare must compile");
+        let thread = compile_cs(&host.device, crate::host::CARD_COMPARE_THREAD).expect("the old compare must compile");
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 16;
+        const SKEW: u32 = 40;
+        let size = PIECE * PIECES as usize;
+        let (Some((now, now_ptr)), Some((hashes_w, _)), Some((hashes_t, _)), Some((differs, differs_ptr))) = (
+            host.shared_buffer(size as u64),
+            host.shared_buffer(16 * u64::from(PIECES)),
+            host.shared_buffer(16 * u64::from(PIECES)),
+            host.shared_buffer(8 * u64::from(PIECES)),
+        ) else {
+            return;
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut bytes: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), now_ptr, size) };
+        // Both forms' passes in one list: the wide form's flags go to dwords
+        // 0..16 of `differs`, the old form's to 16..32.
+        let run = |mode: u32| -> Vec<u32> {
+            // SAFETY: an open list; the compares' own root signatures; live
+            // buffers; the mapping holds the flags.
+            unsafe {
+                for k in 0..2 * PIECES as usize {
+                    differs_ptr.cast::<u32>().add(k).write_volatile(7);
+                }
+                for (shader, hashes, out_at, groups) in
+                    [(&wide, &hashes_w, 0, PIECES), (&thread, &hashes_t, 4 * PIECES, PIECES.div_ceil(64))]
+                {
+                    list.list.SetComputeRootSignature(&shader.root);
+                    list.list.SetPipelineState(&shader.pso);
+                    let constants = [0u32, SKEW, size as u32, PIECES, out_at, mode];
+                    list.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                    list.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    list.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    list.list.Dispatch(groups, 1, 1);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the submission was waited for.
+            (0..2 * PIECES as usize).map(|k| unsafe { differs_ptr.cast::<u32>().add(k).read_volatile() }).collect()
+        };
+        // Piece p's bytes as both forms hash them.
+        let span = |p: usize| {
+            let lo = (p * PIECE).saturating_sub(SKEW as usize) & !15;
+            let hi = (((p + 1) * PIECE - SKEW as usize).min(size) + 15) & !15;
+            (lo, hi.min(size))
+        };
+        run(0);
+        for round in 0..48 {
+            let before = bytes.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = if next() % 3 == 0 {
+                    // At a piece's edge, where the widened pieces overlap.
+                    let edge = (1 + next() as usize % (PIECES as usize - 1)) * PIECE - SKEW as usize;
+                    (edge + next() as usize % 32).saturating_sub(16).min(size - 1)
+                } else {
+                    next() as usize % size
+                };
+                bytes[at] ^= 1 << (next() % 8);
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(bytes[at]) };
+            }
+            let wanted: Vec<u32> = (0..PIECES as usize)
+                .map(|p| {
+                    let (lo, hi) = span(p);
+                    u32::from(before[lo..hi] != bytes[lo..hi])
+                })
+                .collect();
+            let flags = run(2);
+            assert_eq!(&flags[..PIECES as usize], &wanted[..], "the group-a-piece form, round {round}");
+            assert_eq!(&flags[PIECES as usize..], &wanted[..], "the thread-a-piece form, round {round}");
+        }
+    }
+
+    /// A copy that starts 40 bytes into its first piece: its pieces are
+    /// widened to 16 bytes at both ends, and a middle one spans 4,097
+    /// steps of 16 bytes. A byte in the last of them (the next piece's
+    /// first step too) flags both pieces, in both forms of the compare;
+    /// one in a piece's middle, that piece alone; two equal rows swapped,
+    /// the piece.
+    #[test]
+    fn warp_card_compare_sees_each_step_of_a_widened_piece() {
+        for (source, groups) in [(crate::host::CARD_COMPARE, 3), (crate::host::CARD_COMPARE_THREAD, 1)] {
+            let Some(mut warp) = WarpHarness::new() else {
+                return;
+            };
+            let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
+            const PIECE: usize = 64 << 10;
+            const PIECES: u32 = 3;
+            const SKEW: u32 = 40;
+            let size = PIECE * PIECES as usize;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+                // SAFETY: our open list, live buffers, the compare's own
+                // root signature; the mappings hold what is read and written.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(groups, 1, 1);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            };
+            // SAFETY (each): inside the mapping.
+            let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+            run(&mut warp, 0);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+            // Piece 1 is [65,496, 131,032) of the copy, widened to
+            // [65,488, 131,040): its last step [131,024, 131,040) is also
+            // piece 2's first.
+            let last = 2 * PIECE - SKEW as usize - 2;
+            set(last, content[last] ^ 0x10);
+            assert_eq!(run(&mut warp, 1), [0, 1, 1], "the widened last step");
+            set(last, content[last]);
+            let middle = PIECE + 30_000;
+            set(middle, content[middle] ^ 0x01);
+            assert_eq!(run(&mut warp, 1), [0, 1, 0], "a piece's middle");
+            set(middle, content[middle]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+            // Two 16-byte rows of piece 1 swapped.
+            let (a, b) = (PIECE + 1600, PIECE + 3200);
+            for k in 0..16 {
+                set(a + k, content[b + k]);
+                set(b + k, content[a + k]);
+            }
+            assert_eq!(run(&mut warp, 1), [0, 1, 0], "two rows swapped");
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
@@ -1073,7 +1245,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
