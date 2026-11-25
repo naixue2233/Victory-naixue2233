@@ -33,17 +33,18 @@ Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
 ### What `victory-exo` Integrates on Top of `fxceless/victory-fork@f85101b`
 
 - **Performance & Sync:** `#868` (card copy census + opt-in `VICTORY_SKIP_WC_COMPARE=1` for indoor benchmarking), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
-- **Streaming & Stability:** `#855` (DirectStorage re-reads destination physical page numbers instead of failing requests immediately — fixes dropped model/prop/LOD streaming bursts during scene transitions).
+- **Streaming & Stability:** `#855` (DirectStorage re-reads destination physical page numbers instead of failing requests immediately), `#886` (DirectStorage fills spare staging space across queues for faster LOD/model loading), `#892` (dedicated pipeline workers & wait budget for screen passes).
+- **Textures & Formats:** `#374` (BCPack keeps all 32 indices in BC7 dictionary entry 0 — fixes rainbow 4×4 BC7 blocks on character clothing/skin), `#632` (preserves replacement texture views after stale mapping checks), `#559` (texture recheck fingerprint reads every mip of every slice).
 - **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs — **3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
 - **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes — fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
 - **Local integration fixes (`victory-exo`):**
   - Clamp `D3D12_CONSTANT_BUFFER_VIEW_DESC.SizeInBytes` to D3D12's 64 KiB (`65536`) limit (`88f2b82`) to prevent NVIDIA `0x887A0001` device losses on oversized CBVs.
-  - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`).
-  - Verified test suite: `cargo xtask policy` (**183 files ok**), `victory-gpu` (**174/174**), `victory-hle` (**118/118**).
+  - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`), and `#860` `fill_ahead` with `#559` (`c2ca45f`).
+  - Verified test suite: `cargo xtask policy` (**183 files ok**), `victory-formats` (**29/29**), `victory-gpu` (**177/177**), `victory-hle` (**120/120**).
 
 ### Progression & Known Remaining Issues
 - **Verified playable progression:** Boot, menus, opening cutscene, prison interior & corridor, opening interview cutscene, and **Chapter 1 transition / boat scene** (with `0` refused/untranslated shaders and `0` crashes).
-- **Important — `VICTORY_SKIP_WC_COMPARE=1` (`#868`) and water physics:** Leaving `VICTORY_SKIP_WC_COMPARE=1` enabled skips copying back GPU shader writes (~57 MB/frame) to write-combining memory. While it gives a large indoor FPS boost (`7.8–10+ fps`), it prevents the GPU shallow-water simulation (`ceb5eb68cd99cb07`) from feeding buoyancy back to CPU physics in Chapter 1, causing boats to sink below sea level. Keep it **off** for normal gameplay.
+- **Chapter 1 boat buoyancy bug (upstream `#863` / `VIctory#2248`):** The boat sinks to hull depth when physics takes over after the cutscene because `ShallowWaterSim:CS_ResolveHeightLookUps` results are not reaching CPU physics (`CpuReadBackShaderResourceBuffer`). Tracked upstream in `#863` (keep `VICTORY_SKIP_WC_COMPARE=1` **off** for normal gameplay).
 - **Blocky shadow halos & blotchy interior shadows:** The title's lamp/sun shadows and indirect GI are ray-traced via custom compute shaders (`docs/fork-ray-tracing.md`) and are off by default; until live ray tracing lands, screen-space denoisers operate on coarse tile masks along depth edges.
 - **Glitchy foliage/trees & occasional partial character skin textures** during rapid cutscene transitions (next candidates to test: `#858` PSV0 mesh interpolation, `#676`, `#704`, `#740`).
 
