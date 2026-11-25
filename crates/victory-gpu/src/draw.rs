@@ -469,6 +469,15 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether a constant buffer in a descriptor table whose host copy is on
+/// 256 bytes is read from that copy, as root views are, instead of being
+/// copied into the list's upload memory at submission (on by default;
+/// `VICTORY_TABLE_CBV_FILL=1` copies it as before).
+fn table_cbv_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_FILL").is_none_or(|v| v != "1"))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -2672,6 +2681,35 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Read where the card has the buffer, as a root
+                        // view on 256 bytes is ([`root_view`]): a copy into
+                        // upload memory reads title memory on the CPU at
+                        // submission, and where an earlier flight's shaders
+                        // may write (the world's 174 MB heap, whose per-frame
+                        // constants sit beside what its dispatches write)
+                        // the submission waited for them to land, about
+                        // 190 ms a world frame, the submission lock held.
+                        if table_cbv_direct()
+                            && let Some(shadow) = crate::shadow::find(address, 1)
+                            && shadow.left(address) >= u64::from(size)
+                        {
+                            if shadow.gpu(address) % 256 == 0
+                                && shadow.left(address) >= u64::from(size.next_multiple_of(256))
+                            {
+                                shadow.refresh(list, address, u64::from(size));
+                                host.constant_at(index, shadow.gpu(address), size);
+                                continue;
+                            }
+                            // Not on 256 bytes (the console's constants are
+                            // on 16): the card copies them out of its copy.
+                            if shadow.carded()
+                                && let Some(gpu) = list.card_fill(&shadow, address, u64::from(size))
+                            {
+                                shadow.refresh(list, address, u64::from(size));
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
