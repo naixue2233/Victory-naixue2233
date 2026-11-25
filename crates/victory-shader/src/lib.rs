@@ -6,11 +6,12 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
-// Test-only: the symbols must be exported by whatever module hosts the device, and the
-// application defines its own copy in `apps/victory`. Two definitions in one binary would
-// collide at link time.
+// Test-only: the symbols must be exported by whatever module hosts the
+// device, and the application defines its own copy in `apps/victory`. Two
+// definitions in one binary would collide at link time.
 #[cfg(test)]
 pub mod agility;
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -19,6 +20,7 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod spill;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};
