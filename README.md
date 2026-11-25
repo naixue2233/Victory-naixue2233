@@ -1,5 +1,50 @@
 # victory-exo (NVIDIA Wave32 Integration & Performance Fork)
 
+## Merged from the NVIDIA 8 GB fork ([DKTTT/victory-nvidia-8gb](https://github.com/DKTTT/victory-nvidia-8gb))
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), tuned for **8 GB NVIDIA GeForce (32-lane Wave32) GPUs on Windows 11**.
+
+**This repository contains no game files, code, assets, saves, caches, or binaries.** You need your own copy of the title. Licensed **GPL-3.0-or-later**.
+
+## Measured Result (RTX 4060 Laptop 8 GB)
+
+- **Hardware:** Windows 11, NVIDIA GeForce RTX 4060 Laptop GPU (8 GB VRAM, Wave32), 48 GB RAM, Series X profile.
+- **Performance & Visuals:** ~6 FPS (`172.7 ms/frame` at 5,181 draws, `175.2 ms/frame` at 6,271 draws; `~7.2 / 8.0 GB VRAM`, `38% GPU`) with full walls, doors, floor, and natural indirect lighting after one warm-up launch.
+- **Key 8 GB VRAM Finding:** Setting `VICTORY_TEXTURE_DROP_MIPS=2` (without `VICTORY_LEVELS_ON_DEMAND=1`) prevents 8 GB VRAM exhaustion so both diffuse textures and indirect lighting probes upload cleanly on the first launch.
+
+## Quick Build & Run
+
+```powershell
+cargo build --release --bin victory
+.\scripts\play-nvidia-8gb.ps1 -Exe "path\to\title.exe"
+```
+
+*(Note: The first launch warms the shader cache for the paired Wave64 lowering; subsequent launches reuse the cached shaders.)*
+
+## Credits & Integrated PRs
+
+Built on `fxceless/victory-fork@0b0074e` with the following community PRs (integration and testing were AI-assisted):
+
+- `Marvisak/VIctory#1009` (`xmem::low_guards` for >32 GB RAM Windows 11 systems)
+- `fxceless/victory-fork#610` (`VICTORY_TEXTURE_DROP_MIPS=N` for 8 GB cards)
+- `fxceless/victory-fork#799` (NVIDIA Wave32 CBV 64 KiB clamp and host fixes)
+- `fxceless/victory-fork#854` (Paired Wave64 compute lowering on 32-lane GPUs & >32 KiB mesh shaders)
+- `fxceless/victory-fork#868` (`VICTORY_SKIP_WC_COMPARE=1` write-combining copy-back reduction)
+- `fxceless/victory-fork#812` (Park unmapped view blocks to reduce `VirtualQuery` overhead)
+- `fxceless/victory-fork#768` (`VICTORY_WIDE_TEXTURES=1` parallel submission texture checks)
+- `fxceless/victory-fork#864` (Lane-order indirect window record clamping)
+- `fxceless/victory-fork#860` (Stop false trips of the `fill_ahead` latch)
+- `fxceless/victory-fork#936` (Flush `SNAPS` before dropping `Shadow`)
+- `fxceless/victory-fork#432` (Release unmapped placed texture host copies promptly for 8 GB VRAM headroom)
+- `fxceless/victory-fork#932` (Find free dynamic descriptor runs across the search cursor)
+- `fxceless/victory-fork#922` (Disable blending on integer render targets so host pipelines build)
+- `fxceless/victory-fork#896` (Keep texture refresh notifications through streaming bursts)
+- `fxceless/victory-fork#964` (Propagate device removal cleanly from copy queue fences)
+
+---
+
+# VIctory fork (work in progress)
+
 An integration and performance-validated fork of
 [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
 [Marvisak/VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
@@ -20,13 +65,13 @@ Tested on **Windows 11 x64, NVIDIA GeForce RTX 3080 Ti (12 GB VRAM, SM 6.6,
 Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
 `#798`):
 
-| Metric (4,700–6,100 draws/frame, Series X) | `9376fd6` stack | **`victory-exo` (`f85101b` stack)** |
+| Metric (4,700閳?,100 draws/frame, Series X) | `9376fd6` stack | **`victory-exo` (`f85101b` stack)** |
 |---|---|---|
-| **Steady world FPS** | `4.1–4.7 fps` | **`7.8–8.8 fps`** *(10+ fps peaks)* |
-| **Frame time** | `213–243 ms` | **`113.2–127.8 ms`** |
-| **GPU time** | `81–147 ms` | **`29.6–47.5 ms`** |
-| **Copy-back (`VICTORY_SKIP_WC_COMPARE=1`)** | `38–42 ms` (`50–66 MB`) | **`5.2–7.2 ms` (`2.4–2.9 MB`)** |
-| **CPU `preparing` / `copies`** | `83–96 ms` (`150–163 MB`) | **`55–66 ms` (`60–76 MB`)** |
+| **Steady world FPS** | `4.1閳?.7 fps` | **`7.8閳?.8 fps`** *(10+ fps peaks)* |
+| **Frame time** | `213閳?43 ms` | **`113.2閳?27.8 ms`** |
+| **GPU time** | `81閳?47 ms` | **`29.6閳?7.5 ms`** |
+| **Copy-back (`VICTORY_SKIP_WC_COMPARE=1`)** | `38閳?2 ms` (`50閳?6 MB`) | **`5.2閳?.2 ms` (`2.4閳?.9 MB`)** |
+| **CPU `preparing` / `copies`** | `83閳?6 ms` (`150閳?63 MB`) | **`55閳?6 ms` (`60閳?6 MB`)** |
 | **Shader warm-up (`translate --warm`)** | `3,097 / 3,101` | **`3,199 / 3,199` (`0` failed)** |
 | **Refused pipelines / Crashes / Device losses** | `7 refused, 0 crashes` | **`0 refused, 0 crashes, 0 TDRs`** |
 
@@ -34,9 +79,9 @@ Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
 
 - **Performance & Sync:** `#868` (card copy census + opt-in `VICTORY_SKIP_WC_COMPARE=1` for indoor benchmarking), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
 - **Streaming & Stability:** `#855` (DirectStorage re-reads destination physical page numbers instead of failing requests immediately), `#886` (DirectStorage fills spare staging space across queues for faster LOD/model loading), `#892` (dedicated pipeline workers & wait budget for screen passes).
-- **Textures & Formats:** `#374` (BCPack keeps all 32 indices in BC7 dictionary entry 0 — fixes rainbow 4×4 BC7 blocks on character clothing/skin), `#632` (preserves replacement texture views after stale mapping checks), `#559` (texture recheck fingerprint reads every mip of every slice).
-- **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs — **3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
-- **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes — fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
+- **Textures & Formats:** `#374` (BCPack keeps all 32 indices in BC7 dictionary entry 0 閳?fixes rainbow 4鑴? BC7 blocks on character clothing/skin), `#632` (preserves replacement texture views after stale mapping checks), `#559` (texture recheck fingerprint reads every mip of every slice).
+- **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs 閳?**3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
+- **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes 閳?fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
 - **Local integration fixes (`victory-exo`):**
   - Clamp `D3D12_CONSTANT_BUFFER_VIEW_DESC.SizeInBytes` to D3D12's 64 KiB (`65536`) limit (`88f2b82`) to prevent NVIDIA `0x887A0001` device losses on oversized CBVs.
   - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`), and `#860` `fill_ahead` with `#559` (`c2ca45f`).
@@ -327,7 +372,7 @@ Rendering:
 - Shader translation over the title's whole shader pack, RTX 5090 (32-lane waves), `victory translate --validate --pipelines`: 25,682 of 25,953 programs translate, validate and get a pipeline, against 25,452 at 9376fd6 (compute 2,729 of 2,734, mesh 8,694 of 8,765, pixel all 12,067, vertex all 2,192). What is left: the 195 unused voxel geometry stages, five ray-trace programs, and 71 mesh programs as translated alone (linked for their pipelines, below).
 - Console wave64 compute programs on a GPU with 32-lane waves run in a paired form where the host refused them (they asked for 64-lane waves) or where only an approximate per-half form took them: one host wave for each console wave, each thread two of its lanes. The screen-space tracing tiles, particles, decal trails, hair shadow masks and three structure-builder programs get pipelines, and 36 programs in which each half-wave counted, ORed or elected over its own 32 lanes run as on the console, at about 2.9 times their DXIL size (not timed in a run yet). `VICTORY_WAVE_PAIRS=0` turns it off.
 - Mesh programs whose outputs pass D3D12's 32 KiB as translated alone (71: pedestrian, vehicle and prop transforms) are linked with the pixel program of each pipeline, so that the mesh program writes only what that program reads (`VICTORY_MESH_LINK=0` turns it off). Offline, 710 such pairs link, validate and get a pipeline.
-- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 → 2.4 ms a frame).
+- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 閳?2.4 ms a frame).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -336,6 +381,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- On 8 GB cards, `VICTORY_TEXTURE_DROP_MIPS=1` leaves out the largest level of the 2D textures the title fills (they keep about a quarter of their bytes), so the textures picked by index fit in the card's memory budget: on an RTX 4060 Ti 8 GB, about 210 ms a frame in the first room instead of about 430, with 6,000 textures waiting instead of 15,000. Off by default.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
@@ -391,9 +437,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | 閳?|
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
+| Network | Offline by design: the title cannot reach the network | 閳?|
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard and mouse as a pad (rebindable) | Trigger rumble; keyboard prompts |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -416,7 +462,7 @@ D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
 needs nothing.
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
+Check **Committed** under **Task Manager 閳?Performance 閳?Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 

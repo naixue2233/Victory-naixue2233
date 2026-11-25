@@ -140,8 +140,14 @@ struct Window {
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW`; on by
+/// default, `=0` turns it off; off by default with
+/// `VICTORY_CARD_FETCH_INFLIGHT=1`, the one run with a device loss since the
+/// fix below had both on).
+///
+/// On by default since a ten-and-a-half-minute run on an RTX 4070 with no
+/// device loss: the card's time for the title's lists went from about 85
+/// to 37-43 ms a frame, and the frame from about 174 ms to 144-154.
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -187,7 +193,10 @@ const WINDOW_MOST: u64 = 64;
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_INDIRECT_WINDOW") {
+        Some(v) => v == "1",
+        None => std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_none_or(|v| v != "1"),
+    }) && !crate::drvwatch::tripped()
 }
 
 /// What one title list has set, and what its host list was last given.

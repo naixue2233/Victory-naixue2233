@@ -401,7 +401,7 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it 閳?no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -716,7 +716,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known – no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known 閳?no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -733,10 +733,22 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// See [`with_paired_lanes`].
-    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_loose_lds`].
     static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_paired_lanes`].
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with LDS reads and writes inside one lane-branch region accepted
+/// ([`lds_meetings`]): the two host waves of a console wave meet only where
+/// such a region is entered and left. APPROXIMATE: a value one half writes and
+/// the other half reads inside the region may be read stale. The last resort
+/// for console wave64 programs a 32-lane host would otherwise refuse.
+pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_LOOSE.replace(true);
+    let r = f();
+    LDS_LOOSE.set(was);
+    r
 }
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
@@ -759,18 +771,6 @@ pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
     let was = PAIRED.replace(true);
     let r = f();
     PAIRED.set(was);
-    r
-}
-
-/// Runs `f` with LDS reads and writes inside one lane-branch region accepted
-/// ([`lds_meetings`]): the two host waves of a console wave meet only where
-/// such a region is entered and left. APPROXIMATE: a value one half writes and
-/// the other half reads inside the region may be read stale. The last resort
-/// for console wave64 programs a 32-lane host would otherwise refuse.
-pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
-    let was = LDS_LOOSE.replace(true);
-    let r = f();
-    LDS_LOOSE.set(was);
     r
 }
 
@@ -1145,8 +1145,8 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves 閳?DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there 閳?runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1169,7 +1169,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
+                    // 閳?where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -3559,7 +3559,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2锜?(a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3577,7 +3577,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 鑴?32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -3591,7 +3591,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 鑴?anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -4598,7 +4598,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (鑴?4 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -4809,7 +4809,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as ±0 first (MODE is not modelled).
+    // flushing them they would order as 鍗? first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         self.lds_rmw_loop(p, |l, old| l.lds_float_pick(old, data, max))
     }
@@ -9876,7 +9876,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 鑴?the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());

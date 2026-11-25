@@ -1839,6 +1839,18 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line: why [`Shadow::merge_under_writes`] could
+/// not put the title's bytes in and the flights were settled: the copy is
+/// not write-watched; neither the write watch nor the guards could say what
+/// the title wrote; more changed runs than allowed (`VICTORY_MERGE_RUNS`);
+/// no snapshot to compare with.
+static MERGE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_WHY`], taken.
+pub(crate) fn merge_why_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_WHY[i].swap(0, Ordering::Relaxed))
+}
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -1908,7 +1920,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs, join_runs};
+    use super::{PIECE, SNAPS, back_piece, changed_runs, give_back, join_runs, pooled, take_snapshots};
 
     /// Runs with fewer bytes between them than the gap become one, from the
     /// first's start to the last's end; the others stay as they are.
@@ -2048,6 +2060,23 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn take_snapshots_flushes_queued_snaps_before_release() {
+        let src = vec![0x5Au8; 64 << 10];
+        let mut dst = pooled(32 << 10);
+        // SAFETY: `pooled` returns a Vec of at least 32 KiB capacity.
+        unsafe { dst.set_len(32 << 10) };
+        SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((
+            src.as_ptr() as usize,
+            dst.as_mut_ptr() as usize,
+            32 << 10,
+        ));
+        take_snapshots();
+        assert!(dst.iter().all(|&b| b == 0x5A));
+        assert!(SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        give_back(dst);
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -2056,6 +2085,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if wide_back() && !SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            take_snapshots();
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3013,6 +3045,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_WHY[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3025,6 +3058,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_WHY[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3060,6 +3094,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        MERGE_WHY[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3071,6 +3106,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_WHY[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's

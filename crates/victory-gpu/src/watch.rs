@@ -522,7 +522,10 @@ fn known_view(start: usize) -> bool {
     }
     let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_set() && covered(&g.views, first, first + 1))
+    g.protected.contains(&first)
+        || g.absent.contains(&first)
+        || (view_known() && g.viewed.contains(&first))
+        || (view_set() && covered(&g.views, first, first + 1))
 }
 
 struct Guards {
@@ -537,6 +540,10 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// With [`view_known`]: blocks made read-only at least once since the
+    /// runtime last mapped or unmapped them. They are view memory whether
+    /// their guard stands now or a write has opened it.
+    viewed: BTreeSet<usize>,
     /// Blocks known to be view memory ([`guard`]), in order and joined:
     /// a range in them needs no question to Windows to tell.
     views: Vec<(usize, usize)>,
@@ -564,11 +571,19 @@ struct Guards {
     parked_at: u64,
 }
 
+/// Whether a block once guarded stays known as view memory while its
+/// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
+fn view_known() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"))
+}
+
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    viewed: BTreeSet::new(),
     views: Vec::new(),
     unclean: BTreeSet::new(),
     parked: BTreeSet::new(),
@@ -773,7 +788,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // asked Windows again, the walk to the region's end.
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_set() && covered(&g.views, first, last))
+        g.protected.contains(&first)
+            || g.absent.contains(&first)
+            || (view_known() && g.viewed.contains(&first))
+            || (view_set() && covered(&g.views, first, last))
     };
     if !known {
         VIEW_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1034,6 +1052,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        if view_known() {
+            g.viewed.extend(from..to);
+        }
         for block in from..to {
             g.unclean.remove(&block);
         }
@@ -1121,6 +1142,43 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
+/// After the layer wrote `[at, at + len)` of title memory through the
+/// kernel: the dirty bits the kernel holds for those pages are the layer's
+/// own writes, and a refresh that took them for the title's copies the same
+/// bytes up again every frame. Asks the watch to clear them and drops the
+/// answer (nothing is written into title memory between the write and this
+/// asking by design: both are the layer's).
+pub(crate) fn forgot(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const RESET: u32 = 1;
+    if len == 0 {
+        return;
+    }
+    let mut buf = [0usize; 512];
+    let first = at / KERNEL_PAGE * KERNEL_PAGE;
+    let end = at.saturating_add(len);
+    let mut page = first;
+    while page < end {
+        let pages = (end - page).div_ceil(KERNEL_PAGE).min(buf.len());
+        let span = pages * KERNEL_PAGE;
+        let mut count = pages;
+        let mut granularity = 0u32;
+        // SAFETY: `count` entries in the buffer, a whole number of kernel
+        // pages of our own process's memory.
+        let _ = unsafe {
+            GetWriteWatch(
+                RESET,
+                page as *const _,
+                span,
+                buf.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        page += span;
+    }
+}
+
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
@@ -1297,6 +1355,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // Host copies of placed textures there have nothing left to come from.
+    // Record the range; the sweep lets go of them, so that the thread doing
+    // the unmapping does not walk the texture table thousands of times a
+    // second ([`crate::resource::note_unmapped`]).
+    crate::resource::note_unmapped(at as u64, len as u64);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -1311,6 +1374,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    // What the range shows is new: no longer known to be a view.
+    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in viewed {
+        g.viewed.remove(&block);
     }
     // Nor parked: the views below go back to the unclean set.
     let parked: Vec<usize> = g.parked.range(range.clone()).copied().collect();

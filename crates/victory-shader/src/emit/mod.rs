@@ -684,20 +684,20 @@ fn emit_forms(
                     let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
                     report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
                     if done(&again) {
-                        return again;
+                        return exactly(again);
                     }
                 }
             }
             let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
             report("loose LDS (APPROXIMATE)", &again);
             if done(&again) {
-                return again;
+                return exactly(again);
             }
             if local_on && !exact_only {
                 let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
                 report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local;
+                    return exactly(local);
                 }
             }
         }
