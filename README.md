@@ -32,7 +32,8 @@ Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
 
 ### What `victory-exo` Integrates on Top of `fxceless/victory-fork@f85101b`
 
-- **Performance & Sync:** `#868` (write-combining card copies kept on card, `VICTORY_SKIP_WC_COMPARE=1`), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
+- **Performance & Sync:** `#868` (card copy census + opt-in `VICTORY_SKIP_WC_COMPARE=1` for indoor benchmarking), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
+- **Streaming & Stability:** `#855` (DirectStorage re-reads destination physical page numbers instead of failing requests immediately — fixes dropped model/prop/LOD streaming bursts during scene transitions).
 - **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs — **3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
 - **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes — fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
 - **Local integration fixes (`victory-exo`):**
@@ -40,10 +41,11 @@ Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
   - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`).
   - Verified test suite: `cargo xtask policy` (**183 files ok**), `victory-gpu` (**174/174**), `victory-hle` (**118/118**).
 
-### Known Remaining Issues
+### Progression & Known Remaining Issues
+- **Verified playable progression:** Boot, menus, opening cutscene, prison interior & corridor, opening interview cutscene, and **Chapter 1 transition / boat scene** (with `0` refused/untranslated shaders and `0` crashes).
+- **Important — `VICTORY_SKIP_WC_COMPARE=1` (`#868`) and water physics:** Leaving `VICTORY_SKIP_WC_COMPARE=1` enabled skips copying back GPU shader writes (~57 MB/frame) to write-combining memory. While it gives a large indoor FPS boost (`7.8–10+ fps`), it prevents the GPU shallow-water simulation (`ceb5eb68cd99cb07`) from feeding buoyancy back to CPU physics in Chapter 1, causing boats to sink below sea level. Keep it **off** for normal gameplay.
 - **Blocky shadow halos & blotchy interior shadows:** The title's lamp/sun shadows and indirect GI are ray-traced via custom compute shaders (`docs/fork-ray-tracing.md`) and are off by default; until live ray tracing lands, screen-space denoisers operate on coarse tile masks along depth edges.
-- **Occasional partial/speckled character skin textures** during rapid cutscene transitions (tracked against `#676`, `#704`, `#740`, `#794`).
-- **Brief 1 fps dips** during heavy cutscene texture streaming while the indexed texture queue drains.
+- **Glitchy foliage/trees & occasional partial character skin textures** during rapid cutscene transitions (next candidates to test: `#858` PSV0 mesh interpolation, `#676`, `#704`, `#740`).
 
 ### Recommended Launch Profile (NVIDIA 12 GB+ VRAM, Windows 11)
 
@@ -54,7 +56,8 @@ Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
 
 $env:VICTORY_ASYNC_SUBMIT = "1"
 $env:VICTORY_QUEUE2 = "1"
-$env:VICTORY_SKIP_WC_COMPARE = "1"
+# Opt-in indoor benchmark only (keep OFF for water/boat physics in Chapter 1):
+# $env:VICTORY_SKIP_WC_COMPARE = "1"
 $env:VICTORY_LEVELS_ON_DEMAND = "1"
 $env:VICTORY_EARLY_TEXTURES_MS = "60"
 $env:VICTORY_CARD_FETCH_INFLIGHT = "1"
