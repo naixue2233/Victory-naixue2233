@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3); alongside them, the keyboard always drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -454,11 +454,13 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        // Always connected: some keyboards (Wooting) also present an XInput
+        // pad that never reports keys, which would otherwise hide the
+        // stand-in and leave the title without usable input.
+        let fallback = Some(Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1147,9 +1149,9 @@ mod host {
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
+            // pad's buttons, by the stand-in pad's table: a title that
+            // listens to the pad (the title's start screen) then sees them
+            // even with the stand-in beside it.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
@@ -1431,8 +1433,8 @@ mod tests {
         let (hub, host) = fake();
         let log = Log::default();
         register(hub, GAMEPAD_KIND, 2, &log);
-        // Blocking enumeration ran before registration returned: with no
-        // host pad the keyboard's stand-in is the only one.
+        // Blocking enumeration ran before registration returned: the
+        // keyboard's stand-in is there, at rest.
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
         host.lock().unwrap().pads[1] = Some(PadState {
@@ -1441,10 +1443,8 @@ mod tests {
             ..Default::default()
         });
         hub.poll();
-        assert_eq!(
-            log.lock().unwrap()[1..],
-            [(1, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
-        );
+        // The stand-in stays connected beside a host pad.
+        assert_eq!(log.lock().unwrap()[1..], [(1, STATUS_CONNECTED, 0)]);
 
         let first = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(first).buttons, A);
@@ -1476,12 +1476,9 @@ mod tests {
 
         host.lock().unwrap().pads[1] = None;
         hub.poll();
-        assert_eq!(
-            log.lock().unwrap()[3..],
-            [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
-        );
+        assert_eq!(log.lock().unwrap()[2..], [(1, 0, STATUS_CONNECTED)]);
         assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
-        // The stand-in is back, at rest.
+        // The stand-in is still there, at rest.
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
