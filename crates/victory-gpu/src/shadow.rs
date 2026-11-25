@@ -1311,7 +1311,25 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// How many threads [`wide`] can run jobs on: the kept ones and the one that
+/// calls it.
+pub(crate) fn wide_count() -> usize {
+    wide_threads() + 1
+}
+
 type Job = Box<dyn FnOnce() + Send>;
+
+/// How many threads [`wide`] keeps apart from the one that runs the jobs too
+/// (`VICTORY_WIDE_THREADS`; a quarter of the processors, 2 to 6, otherwise).
+fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return n.clamp(1, 32);
+        }
+        std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    })
+}
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
@@ -1328,7 +1346,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1366,7 +1384,7 @@ fn wide(jobs: Vec<Job>) {
         for job in jobs {
             let left = left.clone();
             queue.push_back(Box::new(move || {
-                job();
+                in_wide(job);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1379,7 +1397,7 @@ fn wide(jobs: Vec<Job>) {
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
-            Some(job) => job(),
+            Some(job) => in_wide(job),
             None => break,
         }
     }
@@ -1394,6 +1412,40 @@ fn wide(jobs: Vec<Job>) {
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
+
+/// Whether [`wide`] has threads to give work to besides the calling one
+/// (`VICTORY_WIDE_THREADS=1` leaves none).
+pub(crate) fn wide_available() -> bool {
+    wide_threads() > 1
+}
+
+/// Whether this thread is running a job of [`wide`] now.
+///
+/// A job that hands its bytes to [`wide`] again (a copy of a submission
+/// refresh, cut into pieces by `crate::host::copy_mapped`) would wait on the
+/// threads it is one of: those pieces are read on this thread instead.
+pub(crate) fn in_wide_job() -> bool {
+    IN_WIDE.with(|n| n.get() > 0)
+}
+
+thread_local! {
+    /// How many [`wide`] jobs this thread is inside of.
+    static IN_WIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs one job of [`wide`], marked as such for [`in_wide_job`].
+fn in_wide(job: Box<dyn FnOnce() + Send>) {
+    struct Unmark;
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            IN_WIDE.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+    IN_WIDE.with(|n| n.set(n.get() + 1));
+    let _unmark = Unmark;
+    job();
+}
+
 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;

@@ -206,9 +206,14 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // The pages to look at, collected first: a heap's journal of written
+    // bytes is walked once, in order, on this thread, and what it says is one
+    // page's worth of work (`Look`). Looking at them is what the submission
+    // thread spends its time on, and it does not have to: each page's bytes
+    // are read and compared on their own.
+    let mut work: Vec<Look> = Vec::new();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -224,106 +229,171 @@ pub(crate) fn sync_heaps() {
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
-                    // The kernel says the page was written; writing back the
-                    // bytes it already held is not a change. Compare the
-                    // whole page first: 64 KiB against the copy last read is
-                    // a few microseconds, and the slot walk it saves is
-                    // hundreds.
-                    // What the page held when it was last read, to say which
-                    // of its records moved. The kernel marks a page written
-                    // whether or not the bytes changed, and the title keeps
-                    // thousands of records in these pages.
-                    let (moved_from, moved_to) = {
-                        let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
-                        let held = seen.remove(&from);
-                        // The bytes that differ, and so the records that can
-                        // have changed: a ring of records in one page usually
-                        // moves a handful of them. Records outside that span
-                        // are the ones last mirrored, unless nothing was
-                        // mirrored there yet.
-                        let moved = match &held {
-                            Some(old) if old.as_slice() == page_bytes.as_slice() => {
-                                seen.insert(from, held.unwrap_or_default());
-                                page += crate::watch::PAGE;
-                                continue;
-                            }
-                            Some(old) => difference(old, &page_bytes).unwrap_or((0, page_bytes.len())),
-                            None => (0, page_bytes.len()),
-                        };
-                        if seen.len() >= 4096 {
-                            seen.clear();
-                        }
-                        // The page's bytes kept for the next pass, in the
-                        // memory the last copy held: a clone a page would
-                        // allocate 64 KiB for every page that changed (250 of
-                        // them a frame, on the machine that measured this).
-                        let mut store = held.unwrap_or_default();
-                        store.clear();
-                        store.extend_from_slice(&page_bytes);
-                        seen.insert(from, store);
-                        moved
-                    };
-                    let mut slots = changed_slots(
-                        from + moved_from,
-                        from + moved_to,
-                        start as usize,
-                        step,
-                        mirrored_count,
-                    )
-                    .collect::<Vec<u64>>();
-                    if moved_from != 0 || moved_to != page_bytes.len() {
-                        let all = changed_slots(from, to, start as usize, step, mirrored_count);
-                        for index in all {
-                            if !slots.contains(&index) && host.needs_mirror(index as u32) {
-                                slots.push(index);
-                            }
-                        }
-                        slots.sort_unstable();
-                    }
-                    // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    if page_at_once() {
-                        let (seen, made) =
-                            host.mirror_copied_page(slots.into_iter(), (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                        page += crate::watch::PAGE;
-                        continue;
-                    }
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
-                }
+                work.push(Look {
+                    at,
+                    start,
+                    step,
+                    count: mirrored_count,
+                    from: page.max(range_from),
+                    to: (page + crate::watch::PAGE).min(range_end),
+                });
                 page += crate::watch::PAGE;
             }
         }
     }
+    if !work.is_empty() {
+        // Looked at by this thread and the kept ones at once. A page's
+        // records are mirrored in one go under one lock
+        // (`HostHeap::mirror_copied_page`), so the pages can be looked at in
+        // any order; the reads and compares around that lock, which are most
+        // of the work, no longer wait for each other.
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let done = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64)));
+        let threads = crate::shadow::wide_count().min(work.len()).max(1);
+        let per = work.len().div_ceil(threads);
+        let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(threads);
+        for part in work.chunks(per) {
+            let part = part.to_vec();
+            let (gate, done) = (gate.clone(), done.clone());
+            jobs.push(Box::new(move || {
+                let mut page_bytes: Vec<u8> = Vec::new();
+                let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+                for look in &part {
+                    let (at_pages, at_looked, at_mirrored) = look.take(&mut page_bytes, &gate);
+                    pages += at_pages;
+                    looked += at_looked;
+                    mirrored += at_mirrored;
+                }
+                let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+                done.0 += pages;
+                done.1 += looked;
+                done.2 += mirrored;
+            }));
+        }
+        crate::shadow::wide_run(jobs);
+        let (at_pages, at_looked, at_mirrored) = *done.lock().unwrap_or_else(|e| e.into_inner());
+        pages += at_pages;
+        looked += at_looked;
+        mirrored += at_mirrored;
+    }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// One page [`sync_heaps`] has to look at: the heap it belongs to, the range
+/// of that heap it is part of, and the page's bytes within that range.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Look {
+    at: usize,
+    start: u64,
+    step: u64,
+    count: u32,
+    from: usize,
+    to: usize,
+}
+
+#[cfg(windows)]
+impl Look {
+    /// Reads this page, says which of its records moved, and mirrors those.
+    /// Returns the pages read (one or none), the slots looked at, and the
+    /// records mirrored.
+    ///
+    /// `gate` is held while the page's records are handed to the host heap:
+    /// that is one heap's lock at a time, and what it costs is what
+    /// [`HostHeap::mirror_copied_page`] does, not what the read did.
+    fn take(&self, page_bytes: &mut Vec<u8>, gate: &std::sync::Mutex<()>) -> (u64, u64, u64) {
+        let Look { at, start, step, count, from, to } = *self;
+        // SAFETY: registered heaps are live (removed when dropped), and the
+        // caller holds the registry's read lock for as long as these run.
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(_), Some(_)) = (heap.host.get(), &heap.written, increment(heap.desc.kind)) else {
+            return (0, 0, 0);
+        };
+        // The page's records are read through the kernel, into a copy: a page
+        // the title unmaps meanwhile fails the read where 2,048 reads in place
+        // would fault.
+        page_bytes.resize(to - from, 0);
+        if !crate::host::read_into(from as *const u8, page_bytes) {
+            return (0, 0, 0);
+        }
+        // The kernel says the page was written; writing back the bytes it
+        // already held is not a change. Compare the whole page first: 64 KiB
+        // against the copy last read is a few microseconds, and the slot walk
+        // it saves is hundreds.
+        // What the page held when it was last read, to say which of its
+        // records moved. The kernel marks a page written whether or not the
+        // bytes changed, and the title keeps thousands of records in these
+        // pages.
+        let (moved_from, moved_to) = {
+            let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
+            let held = seen.remove(&from);
+            // The bytes that differ, and so the records that can have
+            // changed: a ring of records in one page usually moves a handful
+            // of them. Records outside that span are the ones last mirrored,
+            // unless nothing was mirrored there yet.
+            let moved = match &held {
+                Some(old) if old.as_slice() == page_bytes.as_slice() => {
+                    seen.insert(from, held.unwrap_or_default());
+                    return (1, 0, 0);
+                }
+                Some(old) => difference(old, page_bytes).unwrap_or((0, page_bytes.len())),
+                None => (0, page_bytes.len()),
+            };
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            // The page's bytes kept for the next pass, in the memory the last
+            // copy held: a clone a page would allocate 64 KiB for every page
+            // that changed (250 of them a frame, on the machine that measured
+            // this).
+            let mut store = held.unwrap_or_default();
+            store.clear();
+            store.extend_from_slice(page_bytes);
+            seen.insert(from, store);
+            moved
+        };
+        // The page's records in one go, under one lock
+        // (`HostHeap::mirror_copied_page`); one by one below with
+        // `VICTORY_HEAP_SYNC_PAGE=0`. The gate keeps one page's records in
+        // the heap at a time.
+        let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots =
+            changed_slots(from + moved_from, from + moved_to, start as usize, step, count).collect::<Vec<u64>>();
+        if moved_from != 0 || moved_to != page_bytes.len() {
+            let all = changed_slots(from, to, start as usize, step, count);
+            for index in all {
+                if !slots.contains(&index) && host.needs_mirror(index as u32) {
+                    slots.push(index);
+                }
+            }
+            slots.sort_unstable();
+        }
+        if page_at_once() {
+            let (seen, made) = host.mirror_copied_page(slots.into_iter(), (start, step), from, page_bytes);
+            return (1, seen, made);
+        }
+        let (mut looked, mut mirrored) = (0u64, 0u64);
+        for index in slots {
+            let handle = start + index * step;
+            // A record that straddles the range's ends is left to the range
+            // that holds its first byte.
+            let Some(at) = (handle as usize).checked_sub(from) else {
+                continue;
+            };
+            let Some(record) = page_bytes.get(at..at + step as usize) else {
+                continue;
+            };
+            looked += 1;
+            // Only a record that is not the one last seen there
+            // (`HostHeap::mirror_copied`).
+            if host.mirror_copied(index as u32, handle, record) {
+                mirrored += 1;
+            }
+        }
+        (1, looked, mirrored)
     }
 }
 
