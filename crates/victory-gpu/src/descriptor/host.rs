@@ -1808,6 +1808,14 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
+    /// Whether the mirror of title slot `index` has to be made whatever the
+    /// record now says: nothing was mirrored there yet, or what was has been
+    /// dropped since (a fingerprint of 0 is "never looked at").
+    pub(crate) fn needs_mirror(&self, index: u32) -> bool {
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        copied.get(index as usize).is_none_or(|print| *print == 0)
+    }
+
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if index >= self.count {
             return false;
@@ -1867,7 +1875,7 @@ impl HostHeap {
     /// made after the page's walk, in slot order as before.
     pub(crate) fn mirror_copied_page(
         &self,
-        slots: std::ops::Range<u64>,
+        slots: impl IntoIterator<Item = u64>,
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],

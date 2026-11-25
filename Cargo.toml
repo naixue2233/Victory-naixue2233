@@ -40,6 +40,8 @@ memchr = "2.8.3"
 # SIMD-accelerated pure-Rust zlib/deflate (Zlib license, runtime AVX2/SSE4.2 dispatch).
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 walkdir = "2.5.1"
+# Zip reading for `cargo xtask agility` (the D3D12 Agility SDK package).
+miniz_oxide = "0.9.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
