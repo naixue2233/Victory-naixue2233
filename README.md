@@ -1,48 +1,112 @@
-# VIctory fork (work in progress)
+# victory-exo (NVIDIA Wave32 Integration & Performance Fork)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+An integration and performance-validated fork of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title natively on Windows from files the user supplies.
+
+`victory-exo` tracks `fxceless/victory-fork` `main` (currently **`f85101b`**)
+and curates tested community pull requests plus NVIDIA Wave32 stability fixes
+into a single verified build, targeting **high frame rates, 100% shader
+translation coverage on 32-lane NVIDIA GPUs, and zero device removals**.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+copy of the title outside the repository. It is not affiliated with or endorsed
+by the title's developer or publisher.
+
+## Status & Measured Results (`victory-exo`, 2026-11-25)
+
+Tested on **Windows 11 x64, NVIDIA GeForce RTX 3080 Ti (12 GB VRAM, SM 6.6,
+Wave32), 64 GB RAM**, Series X profile (with Series S upscaler support via
+`#798`):
+
+| Metric (4,700–6,100 draws/frame, Series X) | `9376fd6` stack | **`victory-exo` (`f85101b` stack)** |
+|---|---|---|
+| **Steady world FPS** | `4.1–4.7 fps` | **`7.8–8.8 fps`** *(10+ fps peaks)* |
+| **Frame time** | `213–243 ms` | **`113.2–127.8 ms`** |
+| **GPU time** | `81–147 ms` | **`29.6–47.5 ms`** |
+| **Copy-back (`VICTORY_SKIP_WC_COMPARE=1`)** | `38–42 ms` (`50–66 MB`) | **`5.2–7.2 ms` (`2.4–2.9 MB`)** |
+| **CPU `preparing` / `copies`** | `83–96 ms` (`150–163 MB`) | **`55–66 ms` (`60–76 MB`)** |
+| **Shader warm-up (`translate --warm`)** | `3,097 / 3,101` | **`3,199 / 3,199` (`0` failed)** |
+| **Refused pipelines / Crashes / Device losses** | `7 refused, 0 crashes` | **`0 refused, 0 crashes, 0 TDRs`** |
+
+### What `victory-exo` Integrates on Top of `fxceless/victory-fork@f85101b`
+
+- **Performance & Sync:** `#868` (write-combining card copies kept on card, `VICTORY_SKIP_WC_COMPARE=1`), `#860` (stop false trips of `fill_ahead` latch), `#857` (coalesce nearby copy-back runs), `#864` (lane-order indirect window clamping), `#812` (park unmapped view blocks), `#768` (`VICTORY_WIDE_TEXTURES=1`), `#845` (warm-cache first-use pipeline scheduling).
+- **Shaders & NVIDIA Wave32:** `#854` (paired Wave64 on 32-lane GPUs + mesh programs >32 KiB linked with pixel programs — **3,199/3,199 shaders translate**, **0 refused pipelines**, removes dark square shirt-edge silhouette artifacts).
+- **Rendering, Textures, Series S & Input:** `#798` (Series S keeps its own upscaler), `#795`, `#764`, `#765` (on-demand tiled texture fixes — fixes character arm BC-block corruption), `#715` (no blending on integer RTs), `#644` (RGBA8 sRGB/linear views), `#510` (inline uploads for rotating movie-ring textures), `#577` (PC keyboard & mouse controls).
+- **Local integration fixes (`victory-exo`):**
+  - Clamp `D3D12_CONSTANT_BUFFER_VIEW_DESC.SizeInBytes` to D3D12's 64 KiB (`65536`) limit (`88f2b82`) to prevent NVIDIA `0x887A0001` device losses on oversized CBVs.
+  - Compose `#765` `Staging` tests with `#510` (`motion_copy`) and `f85101b` (`pooled`) (`eabd5ee`).
+  - Verified test suite: `cargo xtask policy` (**183 files ok**), `victory-gpu` (**174/174**), `victory-hle` (**118/118**).
+
+### Known Remaining Issues
+- **Blocky shadow halos & blotchy interior shadows:** The title's lamp/sun shadows and indirect GI are ray-traced via custom compute shaders (`docs/fork-ray-tracing.md`) and are off by default; until live ray tracing lands, screen-space denoisers operate on coarse tile masks along depth edges.
+- **Occasional partial/speckled character skin textures** during rapid cutscene transitions (tracked against `#676`, `#704`, `#740`, `#794`).
+- **Brief 1 fps dips** during heavy cutscene texture streaming while the indexed texture queue drains.
+
+### Recommended Launch Profile (NVIDIA 12 GB+ VRAM, Windows 11)
+
+```powershell
+# Optional one-time shader cache warm-up (after building):
+# $env:VICTORY_HOST_WAVE="32"; $env:VICTORY_VIEW_LIMIT="999999"
+# .\target\release\victory.exe translate --warm <title_exe>
+
+$env:VICTORY_ASYNC_SUBMIT = "1"
+$env:VICTORY_QUEUE2 = "1"
+$env:VICTORY_SKIP_WC_COMPARE = "1"
+$env:VICTORY_LEVELS_ON_DEMAND = "1"
+$env:VICTORY_EARLY_TEXTURES_MS = "60"
+$env:VICTORY_CARD_FETCH_INFLIGHT = "1"
+$env:VICTORY_WIDE_TEXTURES = "1"
+$env:VICTORY_INDIRECT_WINDOW = "1"
+$env:VICTORY_CARD_REHASH_RUNS = "1"
+$env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "1024"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+$env:VICTORY_PIPELINE_WAIT_MS = "24"
+$env:VICTORY_JOIN_COPIES = "1"
+
+.\target\release\victory.exe run "<path-to-title-exe>" --execute
+# Add `--console series-s` for Series S profile (supported via #798).
+```
+
+*(Upstream validation PR tracking this stack: [fxceless/victory-fork#770](https://github.com/fxceless/victory-fork/pull/770).)*
+
+---
 
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  GPL-3.0-or-later; so is this fork.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** by
+  fxceless and all PR authors (`#510`, `#577`, `#644`, `#715`, `#764`, `#765`,
+  `#768`, `#795`, `#798`, `#812`, `#845`, `#854`, `#857`, `#860`, `#864`,
+  `#868`) plus cross-testing notes from `@ArturoWolff` and `@HLVM04`.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - The guard over every view of a memory page is code by **myokex**
   ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
-  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
+  adapts pull request #115 by Spexivus, its correction by joroyt and a part of
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
-  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
-  are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family).
 
-## Status of this fork (2026-11-25)
+---
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+## Upstream `fxceless/victory-fork` History & Notes (2026-11-25)
 
-| Stage | State in this fork |
+| Stage | Upstream baseline state |
 |-------|--------------------|
 | Boot, menus, start screen | works, 30 fps (as upstream) |
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+| Frame rate in the world | 2-4 fps baseline, 6-7 fps on `f85101b` (RTX 4070), 7.8-10+ fps on `victory-exo` (RTX 3080 Ti) |
+| Stability | no driver hang or device loss in normal runs |
 
 ### Newest (2026-11-25, later the same day)
 
