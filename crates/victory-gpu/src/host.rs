@@ -2485,6 +2485,9 @@ const WHY_RUN: usize = 7;
 const WHY_MOST: usize = 8;
 const WHY_WRITES: usize = 9;
 const WHY_FENCE: usize = 10;
+/// The host view heap's dynamic descriptor slots ran out while a table was
+/// being made: the slots the lists in the air hold come back when they land.
+const WHY_TABLES: usize = 11;
 
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
@@ -2496,7 +2499,7 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
-static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static LATE_WAITED: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
@@ -3211,6 +3214,14 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// [`settle_now`] when the dynamic descriptor slots ran out: the slots a
+/// table needs are held by lists that are in the air or run but have not
+/// landed, and waiting for the card is what gives them back
+/// ([`crate::draw::State::tables_done`], [`crate::list::recycle`]).
+pub(crate) fn settle_for_tables() {
+    settle_now(WHY_TABLES);
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3325,7 +3336,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
-    LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    LATE_WAITED[why.min(11)].fetch_add(us, Ordering::Relaxed);
     submission_us(1, us);
 }
 
@@ -3469,7 +3480,7 @@ fn late_line(frames: f64) {
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
          a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
-         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
+         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}, the dynamic descriptor slots ran out {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
         s[1],
@@ -3488,6 +3499,7 @@ fn late_line(frames: f64) {
         s[WHY_MOST],
         s[WHY_WRITES],
         s[WHY_FENCE],
+        s[WHY_TABLES],
         s[13],
         s[14],
     );
@@ -3496,7 +3508,7 @@ fn late_line(frames: f64) {
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
-             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}",
+             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}, the dynamic descriptor slots ran out {:.1}",
             w[WHY_SYNC],
             w[WHY_CARD_DONE],
             w[WHY_VALUE],
@@ -3506,6 +3518,7 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+            w[WHY_TABLES],
         );
     }
     if relay() {
@@ -5389,7 +5402,7 @@ impl Host {
                 }
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                LATE_WAITED[why.min(11)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {

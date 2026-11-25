@@ -2609,9 +2609,25 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                // No room: the draw must not run with the title's own
-                // offsets (slots never made for it); `bind` drops it.
+            // The slots a table needs are held by the lists that are in the
+            // air: a frame of the opening cutscene asks for 12,500 tables
+            // while thirty submissions are sent ahead, and the 2^18 slots
+            // run out. Waiting for the card lands those lists and gives
+            // their slots back (`tables_done`, `list::recycle`).
+            let first = host.dynamic(n).or_else(|| {
+                crate::host::settle_for_tables();
+                let again = host.dynamic(n);
+                if again.is_some() {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::info!(n, "the dynamic descriptor slots ran out; a wait for the card made room")
+                    });
+                }
+                again
+            });
+            let Some(first) = first else {
+                // No room still: the draw must not run with the title's
+                // own offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
