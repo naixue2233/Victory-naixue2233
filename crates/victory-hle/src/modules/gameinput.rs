@@ -1132,6 +1132,9 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The keys last reported, to log a change once instead of per poll.
+        #[cfg(feature = "diagnostics")]
+        last_keys: Vec<u8>,
     }
 
     impl Source for Host {
@@ -1163,6 +1166,11 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+            }
+            #[cfg(feature = "diagnostics")]
+            if self.last_keys != down {
+                tracing::info!("input keys: {down:02x?} (focused {})", focused());
+                self.last_keys = down.clone();
             }
             down.into_iter()
                 .map(|vk| KeyState {
