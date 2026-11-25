@@ -7410,10 +7410,18 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// A copy this many bytes or longer is read by several threads at once
 /// ([`read`], [`read_wide`]). Below it the hand-over costs what it saves.
-const WIDE_READ_MIN: usize = 2 << 20;
+///
+/// The copies a frame makes are mostly a few hundred kilobytes each (326
+/// ranges, 28 MB in the run that counted them): at two megabytes the hand-over
+/// never happened and the idle cores of the machine stayed idle.
+const WIDE_READ_MIN: usize = 256 << 10;
 
-/// One piece of a [`read_wide`] copy.
+/// The longest piece of a [`read_wide`] copy: shorter ones are cut finer, so
+/// that a range of a few hundred kilobytes still has a piece a thread.
 const WIDE_READ_CHUNK: usize = 2 << 20;
+
+/// The shortest piece of a [`read_wide`] copy.
+const WIDE_READ_LEAST: usize = 64 << 10;
 
 /// [`read`] of a long range, its bytes read by several threads at once
 /// (`crate::shadow::wide`). False if any piece was not readable: the caller
@@ -7426,9 +7434,13 @@ fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let (src, dst) = (src as usize, dst as usize);
     let whole = std::sync::Arc::new(AtomicBool::new(true));
-    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(WIDE_READ_CHUNK));
-    for at in (0..len).step_by(WIDE_READ_CHUNK) {
-        let n = WIDE_READ_CHUNK.min(len - at);
+    // As many pieces as there are threads to read them, none shorter than
+    // it pays to hand over, none longer than a piece is allowed to be.
+    let threads = crate::shadow::wide_count().max(1);
+    let chunk = len.div_ceil(threads).min(WIDE_READ_CHUNK).max(WIDE_READ_LEAST);
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(chunk));
+    for at in (0..len).step_by(chunk) {
+        let n = chunk.min(len - at);
         let whole = whole.clone();
         jobs.push(Box::new(move || {
             // SAFETY: a piece of the caller's range, which it vouches for.
