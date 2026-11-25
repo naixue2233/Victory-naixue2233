@@ -10142,8 +10142,10 @@ impl<'a> Lower<'a> {
         // result as a half float moves 16-bit integers too (the head
         // program's reads of the face network's output), where every
         // access through its view does ([`Self::places_read_as_halves`]).
+        // A d16 access too only where every access does: a whole float
+        // read through the same place would see the unsigned twin.
         let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
-            d16 || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
+            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
         });
         let halves = place.is_some();
         if let Some(place) = place {
