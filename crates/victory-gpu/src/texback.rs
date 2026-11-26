@@ -51,11 +51,14 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     })
 }
 
+/// Whether a texture of `kind` (width, height, format) is copied back.
+pub(crate) fn covers(kind: (u64, u32, u32)) -> bool {
+    kinds().contains(&kind)
+}
+
 /// Whether title texture `resource` is of a kind copied back.
 pub(crate) fn wanted(resource: This) -> bool {
-    let kinds = kinds();
-    !kinds.is_empty()
-        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    crate::resource::texture_kind(resource).is_some_and(covers)
 }
 
 /// An outstanding write to a specific allocation. Mapping and resource
