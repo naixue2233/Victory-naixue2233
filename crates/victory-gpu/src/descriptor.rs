@@ -519,6 +519,12 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// Comparable key of this view record for `VICTORY_BIND_CACHE=1`.
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, u32, [u32; 6]) {
+        (self.resource as usize, self.described, self.desc)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

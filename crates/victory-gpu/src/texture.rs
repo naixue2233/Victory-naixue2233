@@ -570,11 +570,52 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
+/// Optional maximum texture dimension (`VICTORY_TEXTURE_MAX_DIM`, e.g. `1024`
+/// or `512`; off by default). When set alongside `VICTORY_LEVELS_ON_DEMAND=1`,
+/// large 2D placed textures skip allocating VRAM tiles and CPU-detiling mip
+/// levels above this dimension, cutting VRAM and detile CPU time by ~75% on
+/// 2K/4K textures for 8 GB VRAM / 16 GB RAM PCs.
+pub(crate) fn max_dim() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.max(64))
+    })
+}
+
+/// Lowest mip level of a `width x height` texture with `mips` levels whose
+/// dimensions do not exceed `cap` (always keeps at least the coarsest level).
+pub(crate) fn capped_first_mip(width: u32, height: u32, mips: usize, cap: u32) -> usize {
+    if mips <= 1 {
+        return 0;
+    }
+    let mut level = 0usize;
+    while level + 1 < mips && ((width >> level).max(1) > cap || (height >> level).max(1) > cap) {
+        level += 1;
+    }
+    level
+}
+
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    if crate::host::ram_pressure() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.1 > 0 {
+            let bytes = spare.1;
+            let count: usize = spare.0.values().map(Vec::len).sum();
+            spare.0.clear();
+            spare.1 = 0;
+            crate::host::trail(|| {
+                format!("ram-trim: drained {count} spare texture staging buffers ({} MiB)", bytes >> 20)
+            });
+        }
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -1026,6 +1067,10 @@ impl Staging {
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
+        let first = match max_dim() {
+            Some(cap) => first.max(capped_first_mip(self.layout.desc.width, self.layout.desc.height, mips.len(), cap) as u64),
+            None => first,
+        };
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
@@ -1321,8 +1366,12 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
-                // Not the title's: zeros, not what lies in that memory.
-                linear.fill(0);
+                // Non-packed mips above `first_tail_mip` have no tiles mapped
+                // (D3D12 Tier 2 drops writes to unmapped tiles): skip zeroing
+                // multi-megabyte mip 0/1 staging slices on CPU.
+                if mip >= self.layout.first_tail_mip {
+                    linear.fill(0);
+                }
                 continue;
             }
             if let Err(e) =
@@ -2143,4 +2192,17 @@ mod title_memory_tests {
         // SAFETY: freeing our private reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
+
+    #[test]
+    fn capped_first_mip_clamps_large_textures_and_keeps_coarsest_level() {
+        use super::capped_first_mip;
+        assert_eq!(capped_first_mip(4096, 4096, 13, 1024), 2);
+        assert_eq!(capped_first_mip(2048, 1024, 12, 1024), 1);
+        assert_eq!(capped_first_mip(1024, 1024, 11, 1024), 0);
+        assert_eq!(capped_first_mip(512, 512, 10, 1024), 0);
+        // Never drops past the coarsest level even if cap is smaller.
+        assert_eq!(capped_first_mip(4096, 4096, 3, 256), 2);
+        assert_eq!(capped_first_mip(2048, 2048, 1, 512), 0);
+    }
 }
+

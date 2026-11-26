@@ -290,6 +290,30 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// Under `VICTORY_RAM_TRIM_MB` low-RAM pressure, trims the idle host command
+/// list pool down to a small warm floor to release cached upload/scratch memory.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    if !crate::host::ram_pressure() {
+        return;
+    }
+    const KEEP: usize = 16;
+    let dropped: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= KEEP {
+            return;
+        }
+        let excess = idle.0.split_off(KEEP);
+        let freed: u64 = excess.iter().map(|Idle(_, b)| *b).sum();
+        idle.1 = idle.1.saturating_sub(freed);
+        crate::host::trail(|| {
+            format!("ram-trim: released {} idle host command lists ({} MiB scratch)", excess.len(), freed >> 20)
+        });
+        excess
+    };
+    drop(dropped);
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and

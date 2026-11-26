@@ -2172,13 +2172,28 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
+        let slots: Vec<u64> = slots.into_iter().collect();
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, [u32; 3])> = Vec::new();
+        let all_zero = |slice: &[u8]| -> bool {
+            let (chunks, rem) = slice.as_chunks::<8>();
+            chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && rem.iter().all(|&b| b == 0)
+        };
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
+            }
+            // Fast path: if the entire 4 KiB page is zero and every slot in
+            // `slots` is still untouched (`*last == 0`), skip the whole page
+            // without hashing individual descriptor records.
+            if all_zero(page) {
+                let lo = (slots.first().copied().unwrap_or(0) as usize).min(copied.len());
+                let hi = slots.last().map_or(lo, |&end| end as usize + 1).min(copied.len());
+                if copied[lo..hi].iter().all(|&last| last == 0) {
+                    return (slots.len() as u64, 0);
+                }
             }
             for index in slots {
                 let handle = start + index * step;
@@ -2195,11 +2210,14 @@ impl HostHeap {
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
+                // Skip untouched zero slots BEFORE computing `record_print` hash.
+                if *last == 0 && all_zero(record) {
+                    continue;
+                }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                // The record last seen: as it was.
+                if *last == print {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -2209,13 +2227,245 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                let words = if record.len() >= 12 {
+                    [
+                        u32::from_le_bytes([record[0], record[1], record[2], record[3]]),
+                        u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
+                        u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+                    ]
+                } else {
+                    [0; 3]
+                };
+                due.push((index as u32, handle, words));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        let mirrored = due.len() as u64;
+        if !due.is_empty() {
+            self.mirror_copied_batch(&due, frame);
         }
-        (looked, due.len() as u64)
+        (looked, mirrored)
+    }
+
+    /// Batched `mirror(index, handle, false)` for all changed slots of one page
+    /// in `mirror_copied_page`. Acquires `made`, `textures`, `placed`, `buffers`,
+    /// `changed`, and `kept` once per page instead of once per slot (preserving
+    /// exact lock order and stale-slot semantics).
+    fn mirror_copied_batch(&self, due: &[(u32, u64, [u32; 3])], frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut resolved: Vec<(u32, u64, u64, Option<View>)> = Vec::with_capacity(due.len());
+        for &(index, handle, [tag, i, generation]) in due {
+            if index >= self.count {
+                continue;
+            }
+            let key = u64::from(generation) << 32 | u64::from(i);
+            let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+            resolved.push((index, handle, key, view));
+        }
+        if resolved.is_empty() {
+            return;
+        }
+
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active: Vec<(u32, u64, u64, Option<View>)> = Vec::with_capacity(resolved.len());
+        for (index, handle, key, view) in resolved {
+            match view {
+                None => {
+                    if made[index as usize] != 0 {
+                        active.push((index, handle, 0, None));
+                    }
+                }
+                Some(v) => {
+                    if made[index as usize] != key {
+                        active.push((index, handle, key, Some(v)));
+                    }
+                }
+            }
+        }
+        if active.is_empty() {
+            return;
+        }
+
+        // Batched `note_buffer` for non-sampler heaps, keeping exact lock order:
+        // `made` -> `textures` -> `placed` -> `textures` (stale) -> `buffers` -> `changed` -> `kept`.
+        let mut stale_unmake: Vec<u32> = Vec::new();
+        if !self.sampler {
+            let tabled = tabled_out();
+            let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+            {
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let texture = match view {
+                        Some(View::Placed(false, resource, _)) if resource[0] != 1 => {
+                            PLACED_TEXTURE_SLOTS.fetch_add(1, Relaxed);
+                            true
+                        }
+                        Some(View::Shader(r, _))
+                            if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
+                        {
+                            OBJECT_TEXTURE_SLOTS.fetch_add(1, Relaxed);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if texture {
+                        let stamp = if tabled { self.tabled_stamp(index) } else { 0 };
+                        let lately = stamp != 0
+                            && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
+                        let due_frame = if lately {
+                            TABLED_WRITES[0].fetch_add(1, Relaxed);
+                            frame + TABLED_GRACE
+                        } else {
+                            0
+                        };
+                        textures.written(index, frame, due_frame, false);
+                    } else {
+                        textures.remove(index);
+                    }
+                }
+            }
+
+            let mut all_stale: Vec<(u32, u32)> = Vec::new();
+            {
+                let rule = stale_rule();
+                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+                placed.rule = rule;
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let placed_view = match view {
+                        Some(View::Placed(false, resource, desc))
+                            if resource[0] != 1 && !self.tabled_lately(index, frame) =>
+                        {
+                            Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[4]))
+                        }
+                        _ => None,
+                    };
+                    let span = placed_view.and_then(|(resource, start, first)| {
+                        Some((start, start.saturating_add(placed.bytes(resource)?), first))
+                    });
+                    match span {
+                        Some((start, end, first)) => {
+                            SPANNED[0].fetch_min(start, Relaxed);
+                            SPANNED[1].fetch_max(end, Relaxed);
+                            let stale = placed.note(index, start, end, true);
+                            placed.shows(index, first);
+                            for s in stale {
+                                if s != index {
+                                    all_stale.push((index, s));
+                                }
+                            }
+                        }
+                        None => placed.forget(index),
+                    }
+                }
+            }
+
+            if !all_stale.is_empty() {
+                STALE[0].fetch_add(all_stale.len() as u64, Relaxed);
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for &(writer, slot) in &all_stale {
+                    let overwritten_later = slot > writer
+                        && active.binary_search_by_key(&slot, |a| a.0).is_ok();
+                    if !overwritten_later {
+                        textures.remove(slot);
+                        stale_unmake.push(slot);
+                    }
+                }
+            }
+
+            let mut changed_buf: Vec<u32> = Vec::new();
+            {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                for (index, _, _, view) in &active {
+                    let index = *index;
+                    let stride = view.as_ref().and_then(view_stride);
+                    if let Some((_, _, data)) = &self.strides
+                        && index < victory_shader::emit::SLOT_STRIDES_COUNT
+                    {
+                        // SAFETY: inside the mapping; shaders read it while we write.
+                        unsafe {
+                            (*data as *mut u32)
+                                .add(index as usize)
+                                .write_volatile(stride.unwrap_or(0));
+                        }
+                    }
+                    let was = if stride.is_some() {
+                        buffers.insert(index);
+                        true
+                    } else {
+                        buffers.remove(&index)
+                    };
+                    if was {
+                        changed_buf.push(index);
+                    }
+                }
+            }
+            if !changed_buf.is_empty() {
+                let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+                changed.extend(changed_buf);
+            }
+        }
+
+        let mut keep_updates: Vec<(u32, Option<ID3D12Resource>)> = Vec::with_capacity(active.len() + stale_unmake.len());
+        let keep_v = keep_views();
+        for (index, handle, key, view) in active {
+            let Some(view) = view else {
+                made[index as usize] = 0;
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(self.cpu(index));
+                }
+                keep_updates.push((index, None));
+                continue;
+            };
+            let waiting = view.waiting_texture();
+            if let Some(texture) = waiting {
+                super::wait_for(texture, handle);
+            }
+            let later = view.is_buffer() || waiting.is_some();
+            if later
+                && keep_v
+                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                    .is_some_and(|old| same_placed_texture(&old, &view))
+            {
+                KEPT_VIEWS.fetch_add(1, Relaxed);
+                continue;
+            }
+            made[index as usize] = if later { 0 } else { key };
+            let kept = if later {
+                None
+            } else {
+                make(&view, self.cpu(index))
+            };
+            if kept.is_none() && !self.sampler {
+                null_for(&view, self.cpu(index));
+            }
+            keep_updates.push((index, kept.and_then(|made| made.kept)));
+        }
+
+        for slot in stale_unmake {
+            if let Some(old_key) = made.get_mut(slot as usize).map(std::mem::take)
+                && old_key != 0
+            {
+                match view_at(old_key as u32, (old_key >> 32) as u32) {
+                    Some(view) => null_for(&view, self.cpu(slot)),
+                    None => null_view(self.cpu(slot)),
+                }
+                keep_updates.push((slot, None));
+            }
+        }
+
+        if !keep_updates.is_empty() {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, resource) in keep_updates {
+                if let Some(slot) = kept.get_mut(index as usize)
+                    && let Some(old) = std::mem::replace(slot, resource)
+                {
+                    crate::host::retire(old);
+                }
+            }
+        }
     }
 
     /// Makes host slot `index` from the record at `handle` if it is still

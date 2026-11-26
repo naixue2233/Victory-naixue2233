@@ -2395,6 +2395,17 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    if crate::host::ram_pressure() {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if !pool.is_empty() {
+            let count = pool.len();
+            let bytes: u64 = pool.iter().map(|v| v.capacity() as u64).sum();
+            pool.clear();
+            crate::host::trail(|| {
+                format!("ram-trim: drained {count} pooled CPU snapshot buffers ({} MiB)", bytes >> 20)
+            });
+        }
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.

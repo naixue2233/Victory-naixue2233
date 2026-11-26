@@ -1455,11 +1455,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            let capped = crate::texture::max_dim().is_some_and(|cap| {
+                r.desc.width.max(u64::from(r.desc.height)) > u64::from(cap)
+            });
             let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
-                    || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                && (capped
+                    || (bytes >= crate::tiles::floor()
+                        && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                            || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
+                            || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0))));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
