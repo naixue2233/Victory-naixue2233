@@ -4431,7 +4431,7 @@ impl Host {
         // flights' own declared writes (`declared_writes`).
         if crate::census::skip_wc_compare() {
             let before = declared.len();
-            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            declared.retain(|(_, ranges)| !crate::census::skip_due(ranges));
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
         }
         // With the relay: the order of the queue is held from here until

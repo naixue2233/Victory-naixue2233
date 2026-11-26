@@ -82,6 +82,29 @@ pub(crate) fn skip_wc_compare() -> bool {
     })
 }
 
+/// Whether this frame compares and copies back write-combining pieces:
+/// `VICTORY_WC_COMPARE_EVERY=N` compares one frame in N and skips the other
+/// N-1 (default 1, every frame). With the compare skipped entirely
+/// (`VICTORY_SKIP_WC_COMPARE=1`) a frame in N still refreshes what the card
+/// wrote, so a title that samples those bytes lags at most N-1 frames instead
+/// of keeping the first version forever.
+pub(crate) fn compare_due() -> bool {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_WC_COMPARE_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    });
+    every <= 1 || crate::frame::current().is_multiple_of(every)
+}
+
+/// A copy whose declared ranges are all write-combining may be skipped this
+/// frame (`VICTORY_SKIP_WC_COMPARE`, and not a frame [`compare_due`] picks).
+pub(crate) fn skip_due(ranges: &[(usize, usize)]) -> bool {
+    all_wc(ranges) && !compare_due()
+}
 /// Every declared title range must lie wholly inside a single WC reservation.
 /// A card copy (especially an aligned loose window) can cover several.
 pub(crate) fn all_wc(ranges: &[(usize, usize)]) -> bool {
@@ -113,7 +136,7 @@ pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
         return false;
     }
     let wc = all_wc(&[declared]);
-    if wc {
+    if wc && !compare_due() {
         use std::sync::atomic::Ordering;
         let n = SKIPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let b = SKIPPED[1].fetch_add(bytes, Ordering::Relaxed) + bytes;
