@@ -46,10 +46,45 @@ fn integer_format(format: DXGI_FORMAT) -> bool {
     )
 }
 
+/// The formats of what a draw draws into, as the host has them: the eight
+/// render targets (0 where there is none), then depth (0 for none).
+pub(crate) type TargetFormats = [u32; 9];
+
+/// Whether a draw into views of the formats `bound` cannot go to the host
+/// with a pipeline that declares `declared`: a render target slot for which
+/// the pipeline declares a format and a view of another format is bound.
+/// On the console the format is the view's, and the title draws so (run 289:
+/// a pipeline declaring R10G10B10A2_UNORM into an R11G11B10_FLOAT target);
+/// on the host that draw is an invalid call (the debug layer's message 613),
+/// undefined without the layer.
+pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
+    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
+}
+
+/// The formats a pipeline for a draw into `bound` declares
+/// ([`formats_differ`]): the title's own, but for the render target slots it
+/// declares a format for and a view of another format is bound to, which
+/// take the view's. The count of targets and the depth format stay the
+/// title's.
+pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
+    let mut formats = *declared;
+    for i in 0..8 {
+        if declared[i] != 0 && bound[i] != 0 {
+            formats[i] = bound[i];
+        }
+    }
+    formats
+}
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
+    /// The title's own blend state, kept when
+    /// [`GraphicsState::integer_targets_do_not_blend`] changed `blend`: the
+    /// state for other target formats starts from it
+    /// ([`GraphicsState::with_formats`]). Not part of
+    /// [`GraphicsState::describe`].
+    blend_as_given: Option<D3D12_BLEND_DESC>,
     sample_mask: u32,
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
@@ -88,6 +123,7 @@ impl Default for GraphicsState {
                 RenderTarget: [target; 8],
                 ..Default::default()
             },
+            blend_as_given: None,
             sample_mask: u32::MAX,
             rasterizer: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -140,6 +176,8 @@ impl GraphicsState {
         if !(0..n).any(integer) {
             return blend;
         }
+        if self.blend_as_given.is_none() {
+        }
         if !independent {
             let first = blend.RenderTarget[0];
             blend.RenderTarget = [first; 8];
@@ -149,6 +187,59 @@ impl GraphicsState {
             blend.RenderTarget[i].BlendEnable = false.into();
         }
         blend
+    }
+
+    /// The formats the state declares ([`TargetFormats`]): nothing past its
+    /// count of render targets.
+    pub(crate) fn formats(&self) -> TargetFormats {
+        let mut formats = [0; 9];
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
+            *to = from.0 as u32;
+        }
+        formats[8] = self.depth_format.0 as u32;
+        formats
+    }
+
+    /// The same state for a draw into views of the formats `bound`
+    /// ([`formats_differ`]): the target formats are the bound ones,
+    /// everything else is the title's. Blending starts from the title's own
+    /// state and goes off for the targets that hold integers now. Its
+    /// [`GraphicsState::describe`] differs from this state's (the formats are
+    /// part of it), so its host pipeline has a name of its own in the library.
+    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        let mut targets = self.targets;
+        let n = (targets.NumRenderTargets as usize).min(8);
+        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
+            *to = DXGI_FORMAT(from as i32);
+        }
+        let mut state = GraphicsState {
+            blend: self.blend_as_given.unwrap_or(self.blend),
+            blend_as_given: None,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        };
+        state.blend = state.host_blend();
+        state
     }
 
     /// Takes in one subobject of a stream: its type, then its data at +4
@@ -1650,5 +1741,16 @@ mod blend_tests {
         let b = g.host_blend();
         assert_eq!(b.RenderTarget[1].BlendEnable, g.blend.RenderTarget[1].BlendEnable);
         assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+}
+
+#[cfg(test)]
+impl GraphicsState {
+    /// A state that declares one render target, of format `format` (tests).
+    pub(crate) fn declaring(format: i32) -> Self {
+        let mut g = Self::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT(format);
+        g
     }
 }
