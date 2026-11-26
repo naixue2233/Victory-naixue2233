@@ -20,15 +20,15 @@ Three layers on top of `fxceless/victory-fork`:
 | `DKTTT/victory-nvidia-8gb`'s stack | `#610` `#799` `#432` `#854` `#768` `#812` `#860` `#864` `#868` `#896` `#922` `#936` `#964` and `VIctory#1009` |
 | this fork | the Windows 10 / Windows 11 D3D12 runtime choice, the keyboard stand-in pad beside XInput pads, more than one thread for the CPU side of a submission, device-removed data in release builds |
 
-`#783` by [naixue2233](https://github.com/naixue2233) 閳?the descriptor heap sync
-that skips the pages whose bytes did not change 閳?is carried here while it is
+`#783` by [naixue2233](https://github.com/naixue2233) 鈥?the descriptor heap sync
+that skips the pages whose bytes did not change 鈥?is carried here while it is
 open upstream.
 
 ## Windows 10 loads the Agility SDK; Windows 11 uses the system's runtime
 
 Windows 10's in-box D3D12 stops at shader model 6.5 and refuses the root
 signatures every translated pipeline uses (the console's own bit flags), which is
-the `0xc0000005` at `victory-image-閳?dll+0xb5a5f8` in the first frames. Windows
+the `0xc0000005` at `victory-image-鈥?dll+0xb5a5f8` in the first frames. Windows
 11's in-box runtime is new enough on its own, so the extra 1.620.2 copy would
 only stand between the title and what Microsoft shipped for the system.
 
@@ -49,12 +49,12 @@ switch exists to avoid.
 
 | Scene | Frame | Where the time goes |
 |---|---|---|
-| Start screen and loading | `30 fps, 33 ms`, 6閳?5 draws | 閳?|
-| Prologue corridor, `VICTORY_SKIP_WC_COMPARE=1` | `6閳? fps, 117閳?75 ms`, 4,900閳?,900 draws | `78閳?6 ms on the GPU`, `copies 21閳?6 ms / 68閳?9 MB`, `copying back 9閳?6 ms / 5 MB` |
-| Prologue corridor, defaults | `2 fps, 520閳?80 ms`, ~5,200 draws | `copies 200+ MB`, `copying back ~50 MB` |
+| Start screen and loading | `30 fps, 33 ms`, 6鈥?5 draws | 鈥?|
+| Prologue corridor, `VICTORY_SKIP_WC_COMPARE=1` | `6鈥? fps, 117鈥?75 ms`, 4,900鈥?,900 draws | `78鈥?6 ms on the GPU`, `copies 21鈥?6 ms / 68鈥?9 MB`, `copying back 9鈥?6 ms / 5 MB` |
+| Prologue corridor, defaults | `2 fps, 520鈥?80 ms`, ~5,200 draws | `copies 200+ MB`, `copying back ~50 MB` |
 
 The title renders at Series X's 3840x2160 and presents that texture; there is no
-resolution switch to turn down 閳?the swap chain is the size of the texture the
+resolution switch to turn down 鈥?the swap chain is the size of the texture the
 title presents. All of the above is full output.
 
 ## Build and run
@@ -66,7 +66,7 @@ cd D:\path\to\checkout     # victory.toml is found by the current directory
 .\target\release\victory.exe run "D:\path\to\game_scarlett_master.exe" --console series-x --execute
 ```
 
-`scripts/play-nvidia-8gb.ps1 -Exe "閳ヮ泜game_scarlett_master.exe"` sets most of the
+`scripts/play-nvidia-8gb.ps1 -Exe "鈥game_scarlett_master.exe"` sets most of the
 profile below and starts the title for you. The profile the numbers above were
 taken with:
 
@@ -90,9 +90,9 @@ $env:VICTORY_HEAP_SYNC="0"
   tables while tens of submissions are sent ahead, and then the log says `no free
   dynamic descriptor slots: a table is not made` and `a draw whose descriptor
   table found no free slots is dropped`; the title goes on to read descriptors
-  that were never written. Seen once at `victory-image-閳?dll+0x6c0358`
+  that were never written. Seen once at `victory-image-鈥?dll+0x6c0358`
   (`read 0x0`). Since `fe6580a` a draw that finds no slot waits for the in-flight
-  lists to land 閳?they hand their slots back 閳?and only then gives up, and the
+  lists to land 鈥?they hand their slots back 鈥?and only then gives up, and the
   settle line counts the waits as `the dynamic descriptor slots ran out`. A single
   submission that fills the whole pool would still go without; the pool cannot
   simply grow, because the rest of the heap is the title's (its highest view is
@@ -103,10 +103,10 @@ $env:VICTORY_HEAP_SYNC="0"
   `VIctory#2248`). It is worth three to four times the frame rate in the
   corridor; it is not worth it in a boat.
 - **Device losses reported on other machines.** An RTX 4090 laptop on Windows 11
-  build 26200 lost the device with `0x887A0005` after 1閳? submissions sent ahead,
+  build 26200 lost the device with `0x887A0005` after 1鈥? submissions sent ahead,
   both with and without `SKIP_WC_COMPARE`, at `614d995`. Neither has reproduced
-  here. For a report, run with `VICTORY_D3D12_DRED=1` 閳?in a release build as
-  well 閳?to get the faulting allocation and the commands in flight, and
+  here. For a report, run with `VICTORY_D3D12_DRED=1` 鈥?in a release build as
+  well 鈥?to get the faulting allocation and the commands in flight, and
   `VICTORY_LOG=victory_gpu=info` for the log; `VICTORY_D3D12_DEBUG=1` in a
   `--features diagnostics` build adds the debug layer on top.
 - **Light in shadow is missing.** The title's ray-traced bounce light and
@@ -144,7 +144,7 @@ line says otherwise. Tags named ackup/* mark the tree before each step.
 | 2026-11-26 | 8de67ae | A submission that names the same command list twice is split before executing; a repeated list in one ExecuteCommandLists is a DXGI_ERROR_DEVICE_HUNG on real hardware (upstream #675) |
 | 2026-11-26 | 12fbd8c | Pipeline workers are throttled when memory commit headroom is low: at most 2 workers and no speculative prewarming below 4 GiB of available commit (upstream #777, VICTORY_PIPELINE_COMMIT_MB, default 2048) |
 | 2026-11-26 | 84bc28b, 3a49c6f, e136bcc, 59290e0 | Shader fixes: wide title-memory accesses split at page boundaries (#846), SV_Coverage lowered through dx.op.coverage (#657), divergent re-entry into loop exits (#832), and a switch set to nothing keys apart from an unset one in the shader cache (#1132) |
-| 2026-11-26 | 0e363b0 閳?357d30b | Upstream #927: 16-bit buffer accesses keep their bits (halves through a d16 view, the face network's mouths move), plus the table half-view and format-load changes it needs |
+| 2026-11-26 | 0e363b0 鈥?357d30b | Upstream #927: 16-bit buffer accesses keep their bits (halves through a d16 view, the face network's mouths move), plus the table half-view and format-load changes it needs |
 | 2026-11-26 | 72848c8 | A texture copied back keeps every level: the kinds VICTORY_TEXTURE_BACK copies are no longer given fewer mips by VICTORY_TEXTURE_DROP_MIPS, which wrote past the allocation |
 | 2026-11-26 | 56a34c0, 9237f50, 4aa491c, d7a16eb | #1129 compares 64-byte and unaligned 8-byte u64 blocks; #1059 coalesces VirtualProtect runs and reads title memory with NtReadVirtualMemory; #992 hashes each 64 KiB piece with a group of threads (VICTORY_CARD_WIDE_HASH=0 falls back) |
 | 2026-11-26 | 61170ab | A texture copied back keeps the subresources its shaders wrote: only the mip and slices a UAV view names are tiled into title memory (#1152's idea), the rest stays the title's |
@@ -221,9 +221,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | 閳?|
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | 鈥?|
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | 閳?|
+| Network | Offline by design: the title cannot reach the network | 鈥?|
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard and mouse as a pad (rebindable) | Trigger rumble; keyboard prompts |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -255,7 +255,7 @@ the folder is there. `victory config` prints which one, and
 `VICTORY_D3D12_SDK=inbox` or `=agility` forces one for an A/B run.
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager 閳ユ摨erformance 閳ユ摤emory**. If
+Check **Committed** under **Task Manager 鈥擯erformance 鈥擬emory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
