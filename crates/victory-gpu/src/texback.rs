@@ -112,6 +112,11 @@ pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    /// What the list's shaders write in it, as `(mip, first slice, end)`:
+    /// only those subresources go back, the title's own texels elsewhere.
+    written: Mutex<Vec<(u32, u32, u32)>>,
+    /// A view that names no mip and slices covers every subresource.
+    whole: AtomicBool,
 }
 
 impl Target {
@@ -122,10 +127,56 @@ impl Target {
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
-        Some(Self { copy, layout, ticket })
+        Some(Self {
+            copy,
+            layout,
+            ticket,
+            written: Mutex::new(Vec::new()),
+            whole: AtomicBool::new(false),
+        })
+    }
+
+    /// The list's shaders write `mip` and the slices `first..first + count`
+    /// of it through an unordered access view.
+    pub(crate) fn note(&self, mip: u32, first: u32, count: u32) {
+        let (mips, slices) = (self.layout.desc.mips.max(1), self.layout.desc.depth.max(1));
+        let Some(end) = first.checked_add(count).map(|end| end.min(slices)) else {
+            return self.note_whole();
+        };
+        if mip >= mips || first >= end {
+            return self.note_whole();
+        }
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        written.push((mip, first, end));
+    }
+
+    /// The list's shaders write all of it: a view that names no subresource,
+    /// or one this does not follow (a stream output, a resolve).
+    pub(crate) fn note_whole(&self) {
+        self.whole.store(true, Ordering::Release);
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// The subresources to copy back, in a texture of `mips` levels and
+    /// `array` slices: the ones the list's shaders wrote, in subresource
+    /// order. Empty when no view this follows wrote any.
+    fn subresources(&self, mips: u32, array: u32) -> Vec<u32> {
+        if self.whole.load(Ordering::Acquire) {
+            return (0..mips * array).collect();
+        }
+        let written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = std::collections::BTreeSet::new();
+        for &(mip, first, end) in written.iter() {
+            if mip >= mips {
+                continue;
+            }
+            for slice in first..end.min(array) {
+                out.insert(slice * mips + mip);
+            }
+        }
+        out.into_iter().collect()
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -136,6 +187,8 @@ pub(crate) struct Back {
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    /// The subresources the list's shaders wrote: only those go back.
+    written: Vec<u32>,
 }
 
 impl Back {
@@ -154,7 +207,15 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     // SAFETY: a live texture kept through the command list's state tracking.
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels.max(1));
-    let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
+    let array = u32::from(desc.DepthOrArraySize.max(1));
+    // Only the subresources the shaders wrote go back: the rest of the
+    // title's texture is left as the title has it, not as this copy of it
+    // happens to hold it (an unwritten mip holds whatever the card had).
+    let written = target.subresources(mips, array);
+    if written.is_empty() {
+        return None;
+    }
+    let subresources = mips * array;
     let n = subresources as usize;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
@@ -182,7 +243,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let buffer = host.read_back_buffer(total)?;
-    for (i, footprint) in footprints.iter().enumerate() {
+    for &index in &written {
+        let footprint = &footprints[index as usize];
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
@@ -193,12 +255,12 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
         };
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket, written })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -228,8 +290,10 @@ pub(crate) fn land(back: &Back) {
             return;
         }
     }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+    for &index in &back.written {
+        let (mip, slice) = (index % back.mips, index / back.mips);
+        let footprint = &back.footprints[index as usize];
+        let rows = back.rows[index as usize];
         let f = footprint.Footprint;
         let pitch = f.RowPitch as usize;
         let len = pitch * rows as usize * f.Depth as usize;

@@ -132,22 +132,37 @@ pub(crate) fn available_commit_ram() -> Option<u64> {
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    // `VICTORY_VRAM_IDLE_MS=normal,moderate,high` overrides the three steps
+    // (a fork tuned for an 8 GB card runs 8000,2000,1000: a keener run keeps
+    // host copies for longer before letting them go, which costs RAM).
+    fn steps() -> [u64; 3] {
+        static STEPS: std::sync::OnceLock<[u64; 3]> = std::sync::OnceLock::new();
+        *STEPS.get_or_init(|| {
+            let mut steps = [5_000u64, 2_500, 1_000];
+            if let Ok(text) = std::env::var("VICTORY_VRAM_IDLE_MS") {
+                for (step, value) in steps.iter_mut().zip(text.split(',')) {
+                    if let Ok(ms) = value.trim().parse::<u64>() {
+                        *step = ms.max(1_000);
+                    }
+                }
+            }
+            steps
+        })
+    }
+    let [normal_ms, moderate_ms, high_ms] = steps();
     let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
+        return normal_ms;
     };
     if budget == 0 {
-        return NORMAL_MS;
+        return normal_ms;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
     if used_pct >= 85 {
-        HIGH_MS
+        high_ms
     } else if used_pct >= 75 {
-        MODERATE_MS
+        moderate_ms
     } else {
-        NORMAL_MS
+        normal_ms
     }
 }
 
@@ -6552,17 +6567,27 @@ impl HostList {
 
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access: if it is of a kind copied back
-    /// ([`crate::texback`]), the list copies it when it closes.
-    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+    /// ([`crate::texback`]), the list copies it when it closes. `cover` is
+    /// the mip and the slices the view reaches ([`crate::descriptor::host::uav_texture_cover`]);
+    /// without one — a view this does not follow — all of it is copied back.
+    pub(crate) fn texture_written(&self, resource: crate::object::This, cover: Option<(u32, u32, u32)>) {
         if !crate::texback::wanted(resource) {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        if let Some(target) = deferred.back_wanted.iter().find(|target| target.owner() == resource as usize) {
+            match cover {
+                Some((mip, first, count)) => target.note(mip, first, count),
+                None => target.note_whole(),
+            }
+            return;
         }
+        let Some(target) = crate::texback::Target::new(resource) else { return };
+        match cover {
+            Some((mip, first, count)) => target.note(mip, first, count),
+            None => target.note_whole(),
+        }
+        deferred.back_wanted.push(target);
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied

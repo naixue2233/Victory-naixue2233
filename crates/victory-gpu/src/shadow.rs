@@ -391,7 +391,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow, coalesced(joined(ranges), copy_coalesce())));
         }
         true
     });
@@ -405,6 +405,44 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     for (from, to) in ranges {
         match out.last_mut() {
             Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// How many bytes may lie between two changed runs of a copy in the card's
+/// memory and still go up with them (`VICTORY_COPY_COALESCE`, 256; 0 sends
+/// every run on its own).
+///
+/// A frame's runs lie close together: a copy's changed bytes come in runs of
+/// a few hundred bytes with gaps of the same order between them, and every
+/// run is a `CopyBufferRegion` of its own in the list that brings the copy up
+/// to date (514 regions, 87 MB, in run 102). Sending the bytes in a gap too
+/// costs a few hundred bytes of a copy the submission makes anyway and takes
+/// a region off that list. The bytes in the gap are the ones the staging
+/// buffer holds, which are the ones the copy in the card's memory already
+/// holds there: they were sent up when they changed.
+fn copy_coalesce() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_COPY_COALESCE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.min(4096))
+            .unwrap_or(256)
+    })
+}
+
+/// Runs in order, those with at most `gap` bytes between them as one.
+fn coalesced(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    if gap == 0 {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (from, to) in runs {
+        match out.last_mut() {
+            Some(last) if from <= last.1.saturating_add(gap) => last.1 = last.1.max(to),
             _ => out.push((from, to)),
         }
     }

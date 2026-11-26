@@ -2402,6 +2402,27 @@ pub(crate) fn half_inexact(view: &View) -> Option<u32> {
     (!EXACT.contains(&format)).then_some(format)
 }
 
+/// The mip and the array slices a texture unordered access view covers, as
+/// `(mip, first slice, count)`: what a shader writing through it can change.
+/// `None` for views of buffers, 3D textures and multisampled textures, whose
+/// writes are not one mip and a range of slices.
+pub(crate) fn uav_texture_cover(words: &[u32; 10]) -> Option<(u32, u32, u32)> {
+    let desc = uav_desc(words);
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE2D => {
+            // SAFETY: a 2D undescribed view's member.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            Some((view.MipSlice, 0, 1))
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: a 2D array view's member.
+            let view = unsafe { desc.Anonymous.Texture2DArray };
+            Some((view.MipSlice, view.FirstArraySlice, view.ArraySize))
+        }
+        _ => None,
+    }
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
