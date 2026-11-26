@@ -114,6 +114,12 @@ $env:VICTORY_HEAP_SYNC="0"
   structure builder, which is off`), so anything the sun does not hit directly is
   black. There is no switch that turns this on.
 
+- **Do not warm the pipeline library with `victory translate --pipelines`.** It
+  does write `cache/pipelines/host-pipelines.bin`, and the next start that loads
+  that library hangs on the Rockstar logo at 30 fps and 6-10 draws with the CPU
+  idle (seen here at 383 MB of library; moving the file aside brought the next
+  start straight into the world). A run that is played and quit normally saves a
+  library the next start does load - that is the warm-up this fork has.
 ## Change log of this fork
 
 Everything below is this fork's own work on top of the two merged stacks above.
@@ -137,6 +143,11 @@ line says otherwise. Tags named ackup/* mark the tree before each step.
 | 2026-11-26 | 130b790 | The driver watch counts the vendor kernel drivers at any level and the Display source from warning up, so Auto HDR's informational notices no longer trip it for the rest of a run (upstream #1101) |
 | 2026-11-26 | 8de67ae | A submission that names the same command list twice is split before executing; a repeated list in one ExecuteCommandLists is a DXGI_ERROR_DEVICE_HUNG on real hardware (upstream #675) |
 | 2026-11-26 | 12fbd8c | Pipeline workers are throttled when memory commit headroom is low: at most 2 workers and no speculative prewarming below 4 GiB of available commit (upstream #777, VICTORY_PIPELINE_COMMIT_MB, default 2048) |
+| 2026-11-26 | 84bc28b, 3a49c6f, e136bcc, 59290e0 | Shader fixes: wide title-memory accesses split at page boundaries (#846), SV_Coverage lowered through dx.op.coverage (#657), divergent re-entry into loop exits (#832), and a switch set to nothing keys apart from an unset one in the shader cache (#1132) |
+| 2026-11-26 | 0e363b0 … 357d30b | Upstream #927: 16-bit buffer accesses keep their bits (halves through a d16 view, the face network's mouths move), plus the table half-view and format-load changes it needs |
+| 2026-11-26 | 72848c8 | A texture copied back keeps every level: the kinds VICTORY_TEXTURE_BACK copies are no longer given fewer mips by VICTORY_TEXTURE_DROP_MIPS, which wrote past the allocation |
+| 2026-11-26 | 56a34c0, 9237f50, 4aa491c, d7a16eb | #1129 compares 64-byte and unaligned 8-byte u64 blocks; #1059 coalesces VirtualProtect runs and reads title memory with NtReadVirtualMemory; #992 hashes each 64 KiB piece with a group of threads (VICTORY_CARD_WIDE_HASH=0 falls back) |
+| 2026-11-26 | 61170ab | A texture copied back keeps the subresources its shaders wrote: only the mip and slices a UAV view names are tiled into title memory (#1152's idea), the rest stays the title's |
 ---
 
 ## Credits
