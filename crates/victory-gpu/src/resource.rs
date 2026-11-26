@@ -1303,6 +1303,13 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
     if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
         return 0;
     }
+    // A texture copied back into title memory (`crate::texback`) keeps every
+    // level: the read-back writes the console's layout for the whole texture,
+    // and a texture whose allocation is smaller than that layout would have
+    // its neighbours written over.
+    if crate::texback::covers((desc.width, desc.height, desc.format)) {
+        return 0;
+    }
     n
 }
 
