@@ -1442,12 +1442,15 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // What the slots looked at hold now, recorded for the two locks the
+        // pass would otherwise take per slot, and applied when it is done.
+        let mut noted = crate::descriptor::host::Noted::new();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = host.mirror_noted(index, handle, true, &mut noted) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1476,6 +1479,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        noted.apply(host);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =

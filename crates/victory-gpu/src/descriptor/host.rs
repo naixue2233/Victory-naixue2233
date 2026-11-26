@@ -1002,6 +1002,55 @@ fn find_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
     None
 }
 
+/// The buffer-slot bookkeeping of one pass over the heap, applied once at
+/// its end ([`Noted::apply`]).
+///
+/// A pass looks at the slots the title wrote (16,000 a frame on a busy
+/// frame), and each of them would otherwise take the `buffers` and
+/// `changed` locks to record what it now holds; those recorded during the
+/// pass are collected here instead, and the two locks are taken once.
+pub(crate) struct Noted {
+    held: Vec<(u32, bool)>,
+}
+
+impl Noted {
+    pub(crate) fn new() -> Self {
+        Self { held: Vec::new() }
+    }
+
+    fn buffer(&mut self, index: u32, holds: bool) {
+        self.held.push((index, holds));
+    }
+
+    /// Records, in the order the pass saw them, which of the slots it looked
+    /// at hold a buffer view now.
+    pub(crate) fn apply(self, heap: &HostHeap) {
+        if self.held.is_empty() {
+            return;
+        }
+        let mut added = Vec::new();
+        {
+            let mut buffers = heap.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, holds) in self.held {
+                let was = if holds {
+                    buffers.insert(index)
+                } else {
+                    buffers.remove(&index)
+                };
+                if was {
+                    added.push(index);
+                }
+            }
+        }
+        if !added.is_empty() {
+            let mut changed = heap.changed.lock().unwrap_or_else(|e| e.into_inner());
+            for index in added {
+                changed.insert(index);
+            }
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1726,7 +1775,22 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
+    #[cfg(test)]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_into(index, view, seen, None)
+    }
+
+    /// [`note_buffer`], with the buffer-slot bookkeeping collected into
+    /// `noted` when the caller looks at many slots in one pass and applies
+    /// them at its end ([`Noted::apply`]), instead of taking the `buffers`
+    /// and `changed` locks per slot.
+    fn note_buffer_into(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        noted: Option<&mut Noted>,
+    ) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -1797,18 +1861,23 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
-            buffers.insert(index);
-            true
-        } else {
-            buffers.remove(&index)
-        };
-        if was {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+        match noted {
+            Some(notes) => notes.buffer(index, stride.is_some()),
+            None => {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                let was = if stride.is_some() {
+                    buffers.insert(index);
+                    true
+                } else {
+                    buffers.remove(&index)
+                };
+                if was {
+                    self.changed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(index);
+                }
+            }
         }
         stale
     }
@@ -2125,6 +2194,29 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_into(index, handle, for_draw, None)
+    }
+
+    /// [`mirror`], with the buffer-slot bookkeeping of a pass over many
+    /// slots collected into `noted` and applied at the pass's end
+    /// ([`Noted::apply`]).
+    pub(crate) fn mirror_noted(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        noted: &mut Noted,
+    ) -> Option<View> {
+        self.mirror_into(index, handle, for_draw, Some(noted))
+    }
+
+    fn mirror_into(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        mut noted: Option<&mut Noted>,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2152,10 +2244,10 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.forget_tiled(index);
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_into(index, None, false, noted.as_deref_mut());
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_into(index, None, false, noted.as_deref_mut());
             }
             return None;
         };
@@ -2163,7 +2255,7 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            for stale in self.note_buffer_into(index, Some(&view), for_draw, noted.as_deref_mut()) {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
