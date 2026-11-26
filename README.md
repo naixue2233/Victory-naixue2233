@@ -91,8 +91,12 @@ $env:VICTORY_HEAP_SYNC="0"
   dynamic descriptor slots: a table is not made` and `a draw whose descriptor
   table found no free slots is dropped`; the title goes on to read descriptors
   that were never written. Seen once at `victory-image-….dll+0x6c0358`
-  (`read 0x0`). Being worked on; the pool cannot simply grow, because the rest of
-  the heap is the title's (its highest view is about 720,000).
+  (`read 0x0`). Since `fe6580a` a draw that finds no slot waits for the in-flight
+  lists to land — they hand their slots back — and only then gives up, and the
+  settle line counts the waits as `the dynamic descriptor slots ran out`. A single
+  submission that fills the whole pool would still go without; the pool cannot
+  simply grow, because the rest of the heap is the title's (its highest view is
+  about 720,000).
 - **`VICTORY_SKIP_WC_COMPARE=1` breaks Chapter 1's boat.** Shader writes to
   write-combining title memory stay on the card, so the CPU physics never sees
   the water and the hull floats or sinks wrong (upstream `#863`,
@@ -110,6 +114,29 @@ $env:VICTORY_HEAP_SYNC="0"
   structure builder, which is off`), so anything the sun does not hit directly is
   black. There is no switch that turns this on.
 
+## Change log of this fork
+
+Everything below is this fork's own work on top of the two merged stacks above.
+Each line is a commit in this repository; the switches named are off unless the
+line says otherwise. Tags named ackup/* mark the tree before each step.
+
+| Date | Commit | Change |
+|---|---|---|
+| 2026-11-25 | 7952907 | Windows 10: the D3D12 Agility SDK 1.620.2 runtime is loaded app-local, which is what stops the +0xb5a5f8 crash (cargo xtask agility) |
+| 2026-11-25 | 7fe677 | ictory-exo's 22-PR stack merged; #783 (descriptor heap sync by changed pages) carried by naixue2233 |
+| 2026-11-25 | e2ab306 | The keyboard's stand-in pad stays connected beside real XInput pads, so the title keeps its input on machines whose keyboard also presents a pad (upstream #729) |
+| 2026-11-26 | 63091a3 | DKTTT/victory-nvidia-8gb's stack merged: #610 #799 #432 #854 #768 #812 #860 #864 #868 #896 #922 #936 #964, plus VIctory#1009's low-memory guard |
+| 2026-11-26 | 614d995 | The D3D12 runtime is chosen at startup, not at build time: Windows 11 uses the in-box runtime, Windows 10 the app-local one, and d3d12.dll is delay-loaded so the exports are in place before it loads. VICTORY_D3D12_SDK=inbox or =agility overrides |
+| 2026-11-26 | 5ee86fa | The CPU side of a submission runs on more than one thread: copies of title memory are read in 2 MiB pieces, and the pages of a descriptor heap are looked at in parallel (VICTORY_WIDE_THREADS, default a quarter of the processors, 2 to 6) |
+| 2026-11-26 | db85500 | Short copies (256 KiB and up) are split across threads too; measured as no gain here, kept because the split is by size, not by call |
+| 2026-11-26 | 198e9b8 | The per-copy threads for refreshes stay **off** by default: with them on, a run on this machine drew frames with every texture missing |
+| 2026-11-26 | e28707f | Device-removed data (DRED) is available in release builds too: VICTORY_D3D12_DRED=1 names the faulting allocation and the commands in flight |
+| 2026-11-26 | e6580a | A dynamic descriptor table that finds no free slot makes the submission wait for the card once (the in-flight lists hand their slots back) before the draw is dropped; the settle line counts it as 	he dynamic descriptor slots ran out |
+| 2026-11-26 | 9310983 | The water read-back from upstream #999: the textures the title's CPU physics samples (the boat's water) are copied back into title memory, with the stale-write guard. VICTORY_TEXTURE_BACK=1 |
+| 2026-11-26 | 7828ee8, cc20665 | The window notes WM_DISPLAYCHANGE and WM_DEVICECHANGE in the log and in the trail a lost device's report prints, so a display or device change is ruled in or out (upstream #1004) |
+| 2026-11-26 | 130b790 | The driver watch counts the vendor kernel drivers at any level and the Display source from warning up, so Auto HDR's informational notices no longer trip it for the rest of a run (upstream #1101) |
+| 2026-11-26 | 8de67ae | A submission that names the same command list twice is split before executing; a repeated list in one ExecuteCommandLists is a DXGI_ERROR_DEVICE_HUNG on real hardware (upstream #675) |
+| 2026-11-26 | 12fbd8c | Pipeline workers are throttled when memory commit headroom is low: at most 2 workers and no speculative prewarming below 4 GiB of available commit (upstream #777, VICTORY_PIPELINE_COMMIT_MB, default 2048) |
 ---
 
 ## Credits
