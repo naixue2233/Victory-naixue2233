@@ -77,7 +77,11 @@ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A retired object, dropped on whatever thread finishes the submission.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+///
+/// The type name costs a string slice and names the kinds a batch of
+/// retirements is about to drop, so a fault inside one of their `Drop` impls
+/// can be told apart in the log (`VICTORY_LOG=victory_gpu::bury=debug`).
+struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>, &'static str);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
@@ -269,7 +273,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push((started, Retired(Box::new(object), std::any::type_name::<T>())));
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -285,6 +289,18 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
+    if !done.is_empty() && tracing::enabled!(target: "victory_gpu::bury", tracing::Level::DEBUG) {
+        let mut kinds: Vec<(&str, usize)> = Vec::new();
+        for (_, Retired(_, kind)) in &done {
+            match kinds.iter_mut().find(|(seen, _)| seen == kind) {
+                Some((_, n)) => *n += 1,
+                None => kinds.push((kind, 1)),
+            }
+        }
+        kinds.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let named: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} x {k}")).collect();
+        tracing::debug!(target: "victory_gpu::bury", "dropping {} retired objects: {}", done.len(), named.join(", "));
+    }
     drop(done);
 }
 
