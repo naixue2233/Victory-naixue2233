@@ -72,6 +72,10 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit), as the
+    /// bit #907 put it. Off unless `VICTORY_EARLY_Z` asks for it
+    /// ([`super::lower::early_z_level`]).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;

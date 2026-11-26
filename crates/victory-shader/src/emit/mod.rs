@@ -1263,6 +1263,113 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A pixel program the console tests depth for before it runs
+    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
+    /// the title's glass prepass has it) declares ForceEarlyDepthStencil
+    /// under `VICTORY_EARLY_Z=1`: the module differs from the same program
+    /// without the bit only by that flag, the validator, where there is one,
+    /// accepts it, and nothing is declared with the rule off (the default).
+    /// With a depth output the bit is not declared (the host cannot test
+    /// before a shader that writes the depth), nor with the higher levels
+    /// asked for here.
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: db,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = lower::with_early_z(1, || emitted(&color, el("SV_Target", 16, 4), 0x1050));
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        let off = lower::with_early_z(0, || emitted(&color, el("SV_Target", 16, 4), 0x1050));
+        assert_eq!(late, off, "early depth declared with the rule off");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = lower::with_early_z(1, || emitted(&depth, el("SV_Depth", 17, 1), 0x1051));
+        assert_eq!(late, early, "early depth declared for a depth export");
+        // The rule alone: the bit, and no export of depth, stencil or
+        // coverage; then what each level leaves in.
+        let ps = |db| StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: db,
+            patches: vec![],
+        };
+        let rule = |db: u32, unordered: bool, ordered: bool| {
+            (1..5)
+                .filter(|&level| lower::early_depth(level, &ps(db), &[], unordered, ordered))
+                .collect::<Vec<u32>>()
+        };
+        assert!(!lower::early_depth(0, &ps(0x1450), &[], false, false));
+        assert!(lower::early_depth(1, &ps(0x1450), &[], false, false));
+        assert!(lower::early_depth(1, &ps(0x1010), &[], false, false));
+        assert!(!lower::early_depth(1, &ps(0x0450), &[], false, false));
+        assert!(!lower::early_depth(1, &ps(0x1012), &[], false, false));
+        assert!(!lower::early_depth(1, &ps(0x1150), &[], false, false));
+        assert!(!lower::early_depth(
+            1,
+            &ps(0x1050),
+            &[el("SV_StencilRef", 20, 1)],
+            false,
+            false
+        ));
+        assert!(!lower::early_depth(1, &StageIo::None, &[], false, false));
+        // A program that writes unordered views or runs ordered ops keeps
+        // the console's order out of the host's reach from level 2, and one
+        // that can discard a pixel from level 3. The glass prepass's own
+        // shape exports a conservative depth, which level 4 leaves alone.
+        assert_eq!(rule(0x1450, false, false), [1, 2, 3]);
+        assert_eq!(rule(0x1450, true, false), [1]);
+        assert_eq!(rule(0x1450, false, true), [1]);
+        assert_eq!(rule(0x1460, false, false), [1, 2]);
+        assert_eq!(rule(0x1460, true, false), [1]);
+        assert_eq!(rule(0x1050, false, false), [1, 2, 3, 4]);
+        assert_eq!(rule(0x1010, false, false), [1, 2, 3, 4]);
+        assert_eq!(rule(0x1050, true, false), [1]);
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask was
     /// opaque and keyed by the unchanged low dword, so building its lane bit

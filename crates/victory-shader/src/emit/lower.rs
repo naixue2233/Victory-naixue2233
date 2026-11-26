@@ -413,7 +413,7 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it 閳?no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it 闂?no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -729,7 +729,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known 閳?no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known 闂?no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -750,19 +750,10 @@ thread_local! {
     static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_early_z`].
+    static EARLY_Z: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Runs `f` with LDS reads and writes inside one lane-branch region accepted
-/// ([`lds_meetings`]): the two host waves of a console wave meet only where
-/// such a region is entered and left. APPROXIMATE: a value one half writes and
-/// the other half reads inside the region may be read stale. The last resort
-/// for console wave64 programs a 32-lane host would otherwise refuse.
-pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
-    let was = LDS_LOOSE.replace(true);
-    let r = f();
-    LDS_LOOSE.set(was);
-    r
-}
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
 /// each console wave is one host wave of 32 lanes, and host lane n runs console lanes n and
@@ -785,6 +776,110 @@ pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     PAIRED.set(was);
     r
+}
+
+/// Runs `f` with LDS reads and writes inside one lane-branch region accepted
+/// ([`lds_meetings`]): the two host waves of a console wave meet only where
+/// such a region is entered and left. APPROXIMATE: a value one half writes and
+/// the other half reads inside the region may be read stale. The last resort
+/// for console wave64 programs a 32-lane host would otherwise refuse.
+pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_LOOSE.replace(true);
+    let r = f();
+    LDS_LOOSE.set(was);
+    r
+}
+
+/// How far the early-depth rule goes, from `VICTORY_EARLY_Z` (0, the default:
+/// no program declares early depth), or from [`with_early_z`] where that set
+/// one for the thread. See [`early_depth`] for what each level leaves in.
+pub(super) fn early_z_level() -> u32 {
+    EARLY_Z.with(|c| match c.get() {
+        Some(level) => level,
+        None => {
+            let level = match std::env::var("VICTORY_EARLY_Z") {
+                Ok(v) => v.trim().parse().unwrap_or(0),
+                Err(_) => 0,
+            };
+            c.set(Some(level));
+            level
+        }
+    })
+}
+
+/// Runs `f` with the early-depth rule at `level` ([`early_depth`]).
+pub(super) fn with_early_z<R>(level: u32, f: impl FnOnce() -> R) -> R {
+    let was = EARLY_Z.replace(Some(level));
+    let r = f();
+    EARLY_Z.set(was);
+    r
+}
+
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's.
+///
+/// `level` is how far the rule goes, from [`early_z_level`]:
+///
+/// - 1: every program the console tests depth for before it runs, as #907
+///   had it;
+/// - 2: not those that write unordered views or ordered stores either (their
+///   writes land for pixels the test would have rejected);
+/// - 3: and not those that can discard a pixel (`KILL_ENABLE`), the case
+///   where the console's early test and a host's differ most;
+/// - 4: and not those that export a conservative depth (`CONSERVATIVE_Z_EXPORT`,
+///   bit 10): every shape the glass prepass uses carries it, so this leaves
+///   `PS_AlphaPrepass` testing after it runs while the other 2,098 programs
+///   that only ask for the test (bit 4 and bit 6 shapes) still declare it;
+///
+/// never for a program that exports depth, stencil or coverage (bits 0-2 and
+/// 8, or such an output), which cannot test before it runs.
+pub(super) fn early_depth(
+    level: u32,
+    io: &StageIo,
+    outputs: &[SigElement],
+    writes_unordered: bool,
+    ordered_ops: bool,
+) -> bool {
+    /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`.
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    /// Z, stencil and mask exports, and coverage to mask.
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    /// `DB_SHADER_CONTROL.KILL_ENABLE`: the program can discard a pixel.
+    const KILL_ENABLE: u32 = 1 << 5;
+    /// `DB_SHADER_CONTROL.CONSERVATIVE_Z_EXPORT`: the program hands the
+    /// depth test a bound of its own, the shape the glass prepass uses.
+    const CONSERVATIVE_Z_EXPORT: u32 = 1 << 10;
+    if level == 0 {
+        return false;
+    }
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = io
+    else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    let exports = outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20));
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 || db_shader_control & EXPORTS != 0 || exports {
+        return false;
+    }
+    if level >= 2 && (writes_unordered || ordered_ops) {
+        return false;
+    }
+    if level >= 3 && db_shader_control & KILL_ENABLE != 0 {
+        return false;
+    }
+    if level >= 4 && db_shader_control & CONSERVATIVE_Z_EXPORT != 0 {
+        return false;
+    }
+    true
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1109,6 +1204,15 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        if early_depth(
+            early_z_level(),
+            &x.native.io,
+            &x.outputs,
+            writes_uavs,
+            s.ordered,
+        ) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1158,8 +1262,8 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves 閳?DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there 閳?runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves 闂?DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there 闂?runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1182,7 +1286,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // 閳?where every thread of the group gets there (no lane branch around it,
+                    // 闂?where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -3669,7 +3773,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2锜?(a last-place difference).
+    /// different constant than 2闁?(a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3687,7 +3791,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 鑴?32-bit product.
+    /// The high dword of a 32 闁?32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -3701,7 +3805,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 鑴?anything = 0`, as in D3D9.
+    /// `0 闁?anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -4708,7 +4812,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (鑴?4 for st64).
+        // offsets by the element size (闁?4 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -4919,7 +5023,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as 鍗? first (MODE is not modelled).
+    // flushing them they would order as 闁? first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         self.lds_rmw_loop(p, |l, old| l.lds_float_pick(old, data, max))
     }
@@ -10001,7 +10105,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 鑴?the slice).
+    // operand adds 8 闁?the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
