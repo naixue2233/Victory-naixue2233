@@ -10,7 +10,11 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+// 1 MiB, not 512 KiB: two source files we wrote are past half a megabyte
+// (`victory-gpu/src/host.rs` at 562 KB, `victory-shader/src/emit/lower.rs` at
+// 545 KB). The cap is for a binary smuggled in under a text name, and that is
+// caught by the extension list, the magic and the NUL check as well.
+const MAX_FILE_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
