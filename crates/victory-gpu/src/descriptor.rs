@@ -170,24 +170,6 @@ fn mirror(handle: u64) {
     }
 }
 
-/// The bytes of each heap page as [`sync_heaps`] last read them. A page
-/// whose bytes are the same holds no record that changed, so the walk over
-/// its 1,024 to 2,048 records is skipped: that walk, not the read, was most
-/// of the cost (300,000 to 485,000 records looked at a frame, of which
-/// 12,000 to 20,000 were new).
-///
-/// Keyed by the page's address alone, so a heap's pages go with it
-/// ([`Heap`]'s `Drop`): a heap placed where a released one was, holding the
-/// same bytes, would otherwise skip the sync its own host heap (new, and
-/// empty) needs. 64 KiB a page, 4,096 of them at most (256 MB): a world
-/// frame's 300,000 to 485,000 records are 150 to 475 of those pages.
-#[cfg(windows)]
-fn seen_pages() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>> {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>>> =
-        std::sync::OnceLock::new();
-    SEEN.get_or_init(Default::default)
-}
-
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -319,58 +301,12 @@ impl Look {
         if !crate::host::read_into(from as *const u8, page_bytes) {
             return (0, 0, 0);
         }
-        // The kernel says the page was written; writing back the bytes it
-        // already held is not a change. Compare the whole page first: 64 KiB
-        // against the copy last read is a few microseconds, and the slot walk
-        // it saves is hundreds.
-        // What the page held when it was last read, to say which of its
-        // records moved. The kernel marks a page written whether or not the
-        // bytes changed, and the title keeps thousands of records in these
-        // pages.
-        let (moved_from, moved_to) = {
-            let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
-            let held = seen.remove(&from);
-            // The bytes that differ, and so the records that can have
-            // changed: a ring of records in one page usually moves a handful
-            // of them. Records outside that span are the ones last mirrored,
-            // unless nothing was mirrored there yet.
-            let moved = match &held {
-                Some(old) if old.as_slice() == page_bytes.as_slice() => {
-                    seen.insert(from, held.unwrap_or_default());
-                    return (1, 0, 0);
-                }
-                Some(old) => difference(old, page_bytes).unwrap_or((0, page_bytes.len())),
-                None => (0, page_bytes.len()),
-            };
-            if seen.len() >= 4096 {
-                seen.clear();
-            }
-            // The page's bytes kept for the next pass, in the memory the last
-            // copy held: a clone a page would allocate 64 KiB for every page
-            // that changed (250 of them a frame, on the machine that measured
-            // this).
-            let mut store = held.unwrap_or_default();
-            store.clear();
-            store.extend_from_slice(page_bytes);
-            seen.insert(from, store);
-            moved
-        };
         // The page's records in one go, under one lock
         // (`HostHeap::mirror_copied_page`); one by one below with
         // `VICTORY_HEAP_SYNC_PAGE=0`. The gate keeps one page's records in
         // the heap at a time.
         let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut slots =
-            changed_slots(from + moved_from, from + moved_to, start as usize, step, count).collect::<Vec<u64>>();
-        if moved_from != 0 || moved_to != page_bytes.len() {
-            let all = changed_slots(from, to, start as usize, step, count);
-            for index in all {
-                if !slots.contains(&index) && host.needs_mirror(index as u32) {
-                    slots.push(index);
-                }
-            }
-            slots.sort_unstable();
-        }
+        let slots = changed_slots(from, to, start as usize, step, count).collect::<Vec<u64>>();
         if page_at_once() {
             let (seen, made) = host.mirror_copied_page(slots.into_iter(), (start, step), from, page_bytes);
             return (1, seen, made);
@@ -432,18 +368,6 @@ fn page_at_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
-/// The first and last bytes that differ between two copies of a page, as a
-/// range whose end is exclusive: `None` when they are the same.
-#[cfg(windows)]
-fn difference(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
-    if old.len() != now.len() {
-        return Some((0, now.len()));
-    }
-    let first = old.iter().zip(now).position(|(a, b)| a != b)?;
-    let last = old.iter().zip(now).rposition(|(a, b)| a != b)?;
-    Some((first, last + 1))
-}
-
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
 #[cfg(windows)]
@@ -479,17 +403,6 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        // The pages this heap's address range held are no longer the ones a
-        // heap placed there next holds: with its bytes kept, a heap that
-        // looks the same would skip a sync its host heap (new, and empty)
-        // needs. Taken before the range is removed, while it is still known.
-        if let Some(&(start, end, _)) = heaps.iter().find(|&&(_, _, h)| h == at) {
-            let (start, end) = (start as usize, end as usize);
-            seen_pages()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|&page, _| page < start || page >= end);
-        }
         heaps.retain(|&(_, _, h)| h != at);
     }
 }

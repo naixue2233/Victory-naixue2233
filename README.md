@@ -20,10 +20,6 @@ Three layers on top of `fxceless/victory-fork`:
 | `DKTTT/victory-nvidia-8gb`'s stack | `#610` `#799` `#432` `#854` `#768` `#812` `#860` `#864` `#868` `#896` `#922` `#936` `#964` and `VIctory#1009` |
 | this fork | the Windows 10 / Windows 11 D3D12 runtime choice, the keyboard stand-in pad beside XInput pads, more than one thread for the CPU side of a submission, device-removed data in release builds |
 
-`#783` by [naixue2233](https://github.com/naixue2233) 閳?the descriptor heap sync
-that skips the pages whose bytes did not change 閳?is carried here while it is
-open upstream.
-
 ## Windows 10 loads the Agility SDK; Windows 11 uses the system's runtime
 
 Windows 10's in-box D3D12 stops at shader model 6.5 and refuses the root
@@ -129,7 +125,7 @@ line says otherwise. Tags named ackup/* mark the tree before each step.
 | Date | Commit | Change |
 |---|---|---|
 | 2026-11-25 | 7952907 | Windows 10: the D3D12 Agility SDK 1.620.2 runtime is loaded app-local, which is what stops the +0xb5a5f8 crash (cargo xtask agility) |
-| 2026-11-25 | 7fe677 | ictory-exo's 22-PR stack merged; #783 (descriptor heap sync by changed pages) carried by naixue2233 |
+| 2026-11-25 | 7fe677 | ictory-exo's 22-PR stack merged |
 | 2026-11-25 | e2ab306 | The keyboard's stand-in pad stays connected beside real XInput pads, so the title keeps its input on machines whose keyboard also presents a pad (upstream #729) |
 | 2026-11-26 | 63091a3 | DKTTT/victory-nvidia-8gb's stack merged: #610 #799 #432 #854 #768 #812 #860 #864 #868 #896 #922 #936 #964, plus VIctory#1009's low-memory guard |
 | 2026-11-26 | 614d995 | The D3D12 runtime is chosen at startup, not at build time: Windows 11 uses the in-box runtime, Windows 10 the app-local one, and d3d12.dll is delay-loaded so the exports are in place before it loads. VICTORY_D3D12_SDK=inbox or =agility overrides |
@@ -163,10 +159,6 @@ line says otherwise. Tags named ackup/* mark the tree before each step.
   fxceless and all PR authors (`#510`, `#577`, `#644`, `#715`, `#764`, `#765`,
   `#768`, `#795`, `#798`, `#812`, `#845`, `#854`, `#857`, `#860`, `#864`,
   `#868`) plus cross-testing notes from `@ArturoWolff` and `@HLVM04`.
-- **[fxceless/victory-fork#783](https://github.com/fxceless/victory-fork/pull/783)**
-  by [naixue2233](https://github.com/naixue2233): the descriptor heap sync
-  skips the pages whose bytes did not change and walks only the records a
-  page's changed bytes touch. Carried here while upstream has not merged it.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
